@@ -34,6 +34,8 @@ REFRESH_HOURS = float(os.environ.get("BILLTRACKER_REFRESH_HOURS", "6"))  # 0 = o
 INDEX_HOURS = float(os.environ.get("BILLTRACKER_INDEX_HOURS", "24"))  # 0 = off
 FILINGS_HOURS = float(os.environ.get("BILLTRACKER_FILINGS_HOURS", "1"))  # 0 = off
 APP_URL = os.environ.get("BILLTRACKER_URL", "")  # public address, used for links in emails
+# Default alert recipients until someone saves a list in the app (comma separated).
+DEFAULT_RECIPIENTS = [a.strip() for a in os.environ.get("BILLTRACKER_ALERT_TO", "").split(",") if a.strip()]
 DETAIL_MAX_AGE = timedelta(hours=6)
 
 POSITIONS = ["support", "oppose", "monitor", "neutral"]
@@ -131,7 +133,7 @@ def meta_set(key: str, value) -> None:
 def settings() -> dict:
     s = meta_get("settings") or {}
     return {
-        "recipients": s.get("recipients", []),
+        "recipients": s.get("recipients", DEFAULT_RECIPIENTS),
         "alerts_enabled": s.get("alerts_enabled", True),
         "app_url": s.get("app_url", APP_URL),
     }

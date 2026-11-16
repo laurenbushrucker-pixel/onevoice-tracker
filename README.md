@@ -95,6 +95,7 @@ account.
 | `BILLTRACKER_FILINGS_HOURS` | `1` | How often to look for new filings (`0` = off) |
 | `BILLTRACKER_REFRESH_HOURS` | `6` | How often tracked bills are re-checked (`0` = off) |
 | `BILLTRACKER_INDEX_HOURS` | `24` | How often the search index is rebuilt (`0` = off) |
+| `BILLTRACKER_ALERT_TO` | | Alert recipients, comma separated. Used until a list is saved in Alerts & settings. |
 | `BILLTRACKER_URL` | | Public address of the tracker, for links in emails (can also be set in the app) |
 | `BILLTRACKER_DB` | `data/tracker.db` | SQLite database location |
 | `HOST` / `PORT` | `127.0.0.1` / `5000` | Where the web server listens |
