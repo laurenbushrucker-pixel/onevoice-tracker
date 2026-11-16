@@ -53,6 +53,7 @@ async function api(path, opts = {}) {
     ...opts,
     body: opts.body ? JSON.stringify(opts.body) : undefined,
   });
+  if (res.status === 401) { location.reload(); throw new Error("Please sign in again."); }
   let data = null;
   try { data = await res.json(); } catch { /* non-JSON */ }
   if (!res.ok) throw new Error((data && data.error) || `Request failed (${res.status})`);

@@ -20,7 +20,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from flask import Flask, Response, abort, jsonify, request, send_from_directory
+import hmac
+import secrets
+
+from flask import Flask, Response, abort, jsonify, redirect, request, send_from_directory
+from flask import session as login_session
+from flask.sessions import SecureCookieSessionInterface
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import oklegis as ok
 import onevoice as ov
@@ -51,6 +57,17 @@ FILING_TYPES = {"SB": 1, "HB": 1001, "SJR": 1, "HJR": 1001, "SCR": 1, "HCR": 100
 FILING_MISSES = 8  # stop probing a type after this many unused numbers in a row
 
 app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # for the development server; waitress handles this itself
+
+# Sign-in. The password comes from the server's environment, never from the code.
+PASSWORD = os.environ.get("BILLTRACKER_PASSWORD", "")
+SESSION_DAYS = int(os.environ.get("BILLTRACKER_SESSION_DAYS", "30"))
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_NAME="ovt_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(days=SESSION_DAYS),
+)
 
 # ------------------------------------------------------------------ database
 
@@ -612,6 +629,135 @@ BUSY = "Another update is already running. Try again when it finishes."
 # ------------------------------------------------------------------ routes
 
 
+# ------------------------------------------------------------------- sign-in
+
+_failures: dict[str, list[float]] = {}
+FAIL_LIMIT, FAIL_WINDOW = 8, 15 * 60  # 8 wrong passwords in 15 minutes locks that address out for 15 minutes
+
+
+def _client_ip() -> str:
+    return request.remote_addr or "unknown"
+
+
+def _locked_out(ip: str) -> bool:
+    now = time.time()
+    recent = [t for t in _failures.get(ip, []) if now - t < FAIL_WINDOW]
+    _failures[ip] = recent
+    return len(recent) >= FAIL_LIMIT
+
+
+def _secret_key() -> str:
+    key = os.environ.get("BILLTRACKER_SECRET_KEY") or meta_get("secret_key")
+    if not key:
+        key = secrets.token_hex(32)
+        meta_set("secret_key", key)  # kept in the database so sign-ins survive restarts
+    return key
+
+
+LOGIN_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><title>Sign in · OneVoice Tracker</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700&family=Public+Sans:wght@400;600&display=swap">
+<style>
+:root{--bg:#f4f5f2;--card:#fff;--fg:#1e231d;--muted:#5d6659;--line:#d7dcd2;--brand:#4f8a1e;--bright:#76b82a;--err:#b3261e;--errbg:#f8dedb;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#121512;--card:#1a1f1a;--fg:#e7ece4;--muted:#9ea896;--line:#2f362d;--brand:#6aab2e;--err:#ff9a91;--errbg:#46201d;color-scheme:dark}}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:15px/1.5 "Public Sans",system-ui,sans-serif;padding:24px 16px}
+form{background:var(--card);border:1px solid var(--line);border-top:5px solid var(--bright);border-radius:8px;padding:28px;width:100%;max-width:380px;display:flex;flex-direction:column;gap:14px}
+h1{font:700 1.4rem Archivo,sans-serif;margin:0}p{margin:0;color:var(--muted);font-size:.9rem}
+label{display:flex;flex-direction:column;gap:6px;font-weight:600;font-size:.88rem}
+input{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px 12px}
+input:focus-visible,button:focus-visible{outline:2px solid var(--brand);outline-offset:2px}
+button{font:inherit;font-weight:600;background:var(--brand);color:#fff;border:0;border-radius:6px;padding:10px;cursor:pointer}
+.err{background:var(--errbg);color:var(--err);padding:8px 10px;border-radius:6px;font-size:.88rem}
+</style></head><body>
+<form method="post" action="/login">
+<h1>OneVoice Tracker</h1><p>Enter the team password to continue.</p>
+%ERROR%
+<label for="password">Password<input id="password" name="password" type="password" autocomplete="current-password" required autofocus></label>
+<input type="hidden" name="next" value="%NEXT%">
+<button type="submit">Sign in</button>
+</form></body></html>"""
+
+
+def _login_page(error: str = "", next_url: str = "/", status: int = 200):
+    import html as _html
+    body = LOGIN_PAGE.replace("%ERROR%", f'<div class="err" role="alert">{_html.escape(error)}</div>' if error else "")
+    body = body.replace("%NEXT%", _html.escape(next_url if next_url.startswith("/") and not next_url.startswith("//") else "/"))
+    return Response(body, status=status, mimetype="text/html", headers={"Cache-Control": "no-store"})
+
+
+class _SessionInterface(SecureCookieSessionInterface):
+    def get_cookie_secure(self, app):  # Secure flag whenever the site is reached over HTTPS
+        return request.is_secure or super().get_cookie_secure(app)
+
+
+app.session_interface = _SessionInterface()
+
+
+@app.after_request
+def security_headers(resp):
+    resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    return resp
+
+
+@app.before_request
+def require_sign_in():
+    if not app.secret_key:
+        app.secret_key = _secret_key()
+    if request.path in ("/login", "/healthz"):
+        return None
+    if not PASSWORD:
+        if os.environ.get("HOST", "127.0.0.1") in ("127.0.0.1", "localhost"):
+            return None  # running only on this computer: no password needed
+        msg = "Set BILLTRACKER_PASSWORD on the server to turn on sign-in. The tracker stays closed until then."
+        if request.path.startswith("/api/"):
+            return jsonify(error=msg), 503
+        return Response(msg, status=503, mimetype="text/plain")
+    if login_session.get("ok") and hmac.compare_digest(login_session.get("pw", ""), _pw_fingerprint()):
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify(error="Your sign-in has expired. Reload the page to sign in again."), 401
+    return redirect("/login?next=" + request.full_path.rstrip("?"))
+
+
+def _pw_fingerprint() -> str:
+    # Changing the password signs everyone out.
+    return hmac.new(app.secret_key.encode(), PASSWORD.encode(), "sha256").hexdigest()[:16]
+
+
+@app.get("/login")
+def login_form():
+    return _login_page(next_url=request.args.get("next", "/"))
+
+
+@app.post("/login")
+def login_submit():
+    ip = _client_ip()
+    nxt = request.form.get("next", "/")
+    if _locked_out(ip):
+        return _login_page("Too many wrong passwords. Wait 15 minutes and try again.", nxt, 429)
+    if PASSWORD and hmac.compare_digest(request.form.get("password", "").encode(), PASSWORD.encode()):
+        _failures.pop(ip, None)
+        login_session.clear()
+        login_session.permanent = True
+        login_session["ok"] = True
+        login_session["pw"] = _pw_fingerprint()
+        return redirect(nxt if nxt.startswith("/") and not nxt.startswith("//") else "/")
+    _failures.setdefault(ip, []).append(time.time())
+    return _login_page("That password isn't right. Check it and try again.", nxt, 401)
+
+
+@app.get("/logout")
+def logout():
+    login_session.clear()
+    return redirect("/login")
+
+
+@app.get("/healthz")
+def healthz():
+    return jsonify(ok=True)
+
+
 @app.get("/")
 def index_page():
     return send_from_directory(app.static_folder, "index.html")
@@ -1052,6 +1198,7 @@ def api_export():
 
 def main(argv: list[str]) -> None:
     init_db()
+    app.secret_key = _secret_key()
     cmd = argv[1] if len(argv) > 1 else "serve"
     say = lambda i, t, label: print(f"[{i}/{t}] {label}", flush=True)  # noqa: E731
     if cmd == "index":
@@ -1076,7 +1223,13 @@ def main(argv: list[str]) -> None:
     try:
         from waitress import serve  # production server, if installed
         print(f"OneVoice Tracker on http://{host}:{port}", flush=True)
-        serve(app, host=host, port=port, threads=8)
+        if os.environ.get("BILLTRACKER_TRUST_PROXY", "true") == "true":
+            # Behind a host like Render: take the visitor's address and HTTPS from the proxy's headers.
+            serve(app, host=host, port=port, threads=8, trusted_proxy="*", trusted_proxy_count=1,
+                  trusted_proxy_headers={"x-forwarded-for", "x-forwarded-proto", "x-forwarded-host"},
+                  clear_untrusted_proxy_headers=True)
+        else:
+            serve(app, host=host, port=port, threads=8)
     except ImportError:
         app.run(host=host, port=port, debug=False, threaded=True)
 

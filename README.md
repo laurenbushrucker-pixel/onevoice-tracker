@@ -89,6 +89,17 @@ should get alerts, and click **Send a test email**.
 Email alerts only go out while the tracker is running, so for real use run it
 on an always-on server (see Hosting below).
 
+## Password
+
+Set `BILLTRACKER_PASSWORD` on the server. Everyone signs in with that one
+team password, and stays signed in for 30 days (`BILLTRACKER_SESSION_DAYS`).
+Changing the password signs everyone out. After 8 wrong passwords in 15
+minutes, that address is locked out for 15 minutes.
+
+When the tracker runs only on your own computer (`HOST` left at
+`127.0.0.1`) no password is needed. On a server with no password set, the
+tracker stays closed and says so, so it can never be left open by accident.
+
 ## Email setup
 
 Set these environment variables before starting the app:
@@ -117,6 +128,7 @@ account.
 | `BILLTRACKER_FILINGS_HOURS` | `1` | How often to look for new filings (`0` = off) |
 | `BILLTRACKER_REFRESH_HOURS` | `6` | How often tracked bills are re-checked (`0` = off) |
 | `BILLTRACKER_INDEX_HOURS` | `24` | How often the search index is rebuilt (`0` = off) |
+| `BILLTRACKER_PASSWORD` | | Team password for signing in (required on a server) |
 | `ANTHROPIC_API_KEY` | | Turns on AI summaries |
 | `BILLTRACKER_SUMMARY_SCOPE` | `agenda` | Which bills get summaries automatically: `agenda`, `tracked` or `all` |
 | `BILLTRACKER_ALERT_TO` | | Alert recipients, comma separated. Used until a list is saved in Alerts & settings. |

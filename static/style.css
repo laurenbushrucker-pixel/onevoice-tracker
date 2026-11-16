@@ -281,3 +281,5 @@ select.pos-monitor { background: var(--monitor-bg); } select.pos-neutral { backg
 .bills td.last-action { max-width: 240px; font-size: 0.88rem; }
 .result .last b { color: var(--fg); font-weight: 600; }
 @media (max-width: 720px) { .bills td.author { display: inline-block; width: auto; margin-left: 8px; } }
+.signout { color: #fff; opacity: 0.8; font-size: 0.85rem; font-weight: 600; }
+.signout:hover { opacity: 1; }
