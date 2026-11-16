@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OneVoice Tracker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Public+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="masthead">
+  <div class="wrap masthead-row">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <h1>OneVoice Tracker</h1>
+        <p class="brand-sub" id="brand-sub">Oklahoma Legislature · data from oklegislature.gov</p>
+      </div>
+    </div>
+    <div class="masthead-tools">
+      <label class="field-inline" for="session">Session
+        <select id="session"></select>
+      </label>
+      <button class="btn btn-light" id="btn-refresh" type="button">Check tracked bills</button>
+    </div>
+  </div>
+  <nav class="wrap tabs" aria-label="Views">
+    <a href="#agenda" data-view="agenda">Agenda</a>
+    <a href="#mine" data-view="mine">My bills <span class="count" id="count-mine"></span></a>
+    <a href="#find" data-view="find">Find bills</a>
+    <a href="#updates" data-view="updates">Updates <span class="count count-alert" id="count-updates" hidden></span></a>
+    <a href="#settings" data-view="settings">Alerts &amp; settings</a>
+  </nav>
+</header>
+
+<div class="wrap">
+  <div class="statusbar" id="statusbar" role="status" aria-live="polite"></div>
+</div>
+
+<main class="wrap">
+  <!-- Agenda -->
+  <section id="view-agenda" class="view" hidden>
+    <div class="agenda-head">
+      <div>
+        <h2 id="agenda-name">OneVoice State Priorities</h2>
+        <p class="hint" id="agenda-summary"></p>
+      </div>
+      <div class="agenda-actions">
+        <span class="alert-state" id="alert-state"></span>
+        <button class="btn" id="btn-filings" type="button">Check for new filings</button>
+      </div>
+    </div>
+    <div id="agenda-list" class="agenda-list"></div>
+    <p class="hint">Bills are matched by keywords in their official short title and subjects. A match means a bill is worth a look, not that it supports or opposes the agenda. Use <b>Edit keywords</b> to tune what each priority catches.</p>
+  </section>
+
+  <!-- My bills -->
+  <section id="view-mine" class="view" hidden>
+    <div class="pipeline" id="pipeline" aria-label="Tracked bills by status"></div>
+    <div class="toolbar">
+      <input id="mine-q" type="search" placeholder="Filter by number, title, label or note" aria-label="Filter tracked bills">
+      <select id="mine-position" aria-label="Position"><option value="">Any position</option></select>
+      <select id="mine-priority" aria-label="Priority"><option value="">Any priority</option></select>
+      <select id="mine-agenda" aria-label="OneVoice priority"><option value="">Any agenda item</option></select>
+      <select id="mine-sort" aria-label="Sort">
+        <option value="bill">Sort by bill number</option>
+        <option value="recent">Sort by latest action</option>
+        <option value="priority">Sort by priority</option>
+      </select>
+      <form class="quick-add" id="quick-add">
+        <input id="quick-bill" placeholder="Add bill, e.g. HB 1234" aria-label="Bill number to track">
+        <button class="btn" type="submit">Track</button>
+      </form>
+      <a class="btn btn-ghost" id="export" href="#">Export CSV</a>
+    </div>
+    <div class="table-wrap">
+      <table class="bills" id="mine-table">
+        <thead><tr>
+          <th>Bill</th><th>Title</th><th>Status</th><th>Latest action</th><th>Position</th><th>Priority</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="empty" id="mine-empty" hidden>
+      <h2>No bills tracked yet</h2>
+      <p>Open the <a href="#agenda">Agenda</a> to see bills that match each OneVoice priority, or type a bill number above.</p>
+    </div>
+  </section>
+
+  <!-- Find bills -->
+  <section id="view-find" class="view" hidden>
+    <a class="back-link" id="find-back" href="#agenda" hidden>&larr; Back to the agenda</a>
+    <form class="toolbar" id="find-form">
+      <input id="find-q" type="search" placeholder="Keyword or bill number (e.g. teacher pay, SB 206)" aria-label="Search">
+      <select id="find-agenda" aria-label="OneVoice priority">
+        <option value="">All bills</option><option value="any">Matches any agenda item</option>
+      </select>
+      <select id="find-subject" aria-label="Subject"><option value="">All subjects</option></select>
+      <select id="find-chamber" aria-label="Chamber">
+        <option value="">Both chambers</option><option value="H">House measures</option><option value="S">Senate measures</option>
+      </select>
+      <select id="find-stage" aria-label="Status"><option value="">Any status</option></select>
+      <select id="find-sort" aria-label="Sort">
+        <option value="">By bill number</option><option value="newest">Newest first</option>
+      </select>
+      <button class="btn" type="submit">Search</button>
+    </form>
+    <p class="hint" id="find-meta"></p>
+    <ol class="results" id="find-results"></ol>
+    <div class="center"><button class="btn btn-ghost" id="find-more" type="button" hidden>Show more</button></div>
+    <div class="empty" id="find-noindex" hidden>
+      <h2>This session hasn’t been indexed yet</h2>
+      <p>Keyword and subject search uses the Legislature’s subject index. Building it reads about 100 pages from oklegislature.gov and takes a couple of minutes. Newly filed bills appear before they are indexed when you click <b>Check for new filings</b>, and you can always look up a bill by number.</p>
+      <button class="btn" id="btn-index" type="button">Build search index</button>
+    </div>
+  </section>
+
+  <!-- Updates -->
+  <section id="view-updates" class="view" hidden>
+    <div class="toolbar">
+      <p class="hint grow">New actions on bills you track, found when the tracker checks oklegislature.gov.</p>
+      <button class="btn btn-ghost" id="mark-seen" type="button">Mark all as read</button>
+    </div>
+    <ol class="feed" id="feed"></ol>
+    <div class="empty" id="feed-empty" hidden>
+      <h2>No new actions</h2>
+      <p>When a tracked bill gets a new action, such as a committee vote, a floor vote or the Governor’s signature, it shows up here.</p>
+    </div>
+  </section>
+
+  <!-- Settings -->
+  <section id="view-settings" class="view" hidden>
+    <form class="panel" id="settings-form">
+      <h2>Email alerts for newly filed bills</h2>
+      <p class="hint" id="alerts-explainer"></p>
+      <div class="email-status" id="email-status"></div>
+      <label class="check" for="s-enabled"><input type="checkbox" id="s-enabled"> Send alert emails</label>
+      <label class="stack" for="s-recipients">Send alerts to (one address per line)
+        <textarea id="s-recipients" rows="4" placeholder="name@example.org"></textarea>
+      </label>
+      <label class="stack" for="s-url">Tracker web address (used for links in the email)
+        <input id="s-url" placeholder="https://onevoice-tracker.example.org/">
+      </label>
+      <div class="row-end">
+        <button class="btn" type="submit">Save settings</button>
+        <button class="btn btn-ghost" type="button" id="s-test">Send a test email</button>
+      </div>
+      <p class="hint" id="s-last"></p>
+    </form>
+    <div class="panel">
+      <h2>Agenda keywords</h2>
+      <p class="hint">Restore every priority’s keywords to the version that ships with the app. Your tracked bills and notes are kept.</p>
+      <div class="row-end" id="reset-area"><button class="btn btn-ghost" type="button" id="agenda-reset">Restore default keywords</button></div>
+    </div>
+  </section>
+</main>
+
+<!-- Bill detail -->
+<div class="scrim" id="scrim" hidden></div>
+<aside class="drawer" id="drawer" aria-label="Bill details" hidden>
+  <div class="drawer-head">
+    <button class="btn btn-ghost btn-sm" id="drawer-close" type="button">Close</button>
+    <button class="btn btn-ghost btn-sm" id="drawer-refresh" type="button">Reload from site</button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
