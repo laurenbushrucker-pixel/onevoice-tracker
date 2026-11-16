@@ -265,3 +265,19 @@ select.pos-monitor { background: var(--monitor-bg); } select.pos-neutral { backg
 .back-link { font-weight: 600; text-decoration: none; align-self: flex-start; }
 .back-link:hover { text-decoration: underline; }
 .kw-editor label.check { flex-direction: row; align-items: center; color: var(--fg); font-size: 0.86rem; }
+
+/* AI summaries */
+.ai-summary { margin: 0; line-height: 1.45; }
+.ai-summary.big { font-size: 1rem; }
+.ai-missing { margin: 0; color: var(--muted); font-size: 0.86rem; font-style: italic; }
+.official-title { margin: 4px 0 0; color: var(--muted); font-size: 0.78rem; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.ai-note { margin: 6px 0 0; color: var(--muted); font-size: 0.78rem; }
+.linkish { background: none; border: 0; padding: 0; color: var(--brand); font: inherit; font-style: normal; font-weight: 600; cursor: pointer; text-decoration: underline; }
+.d-ai { background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--brand-bright); border-radius: var(--radius); padding: 12px 14px; }
+.d-ai .section-h { margin-bottom: 4px; }
+.result-top .by { color: var(--muted); font-size: 0.86rem; }
+.bills td.author { white-space: nowrap; color: var(--muted); font-size: 0.88rem; }
+.bills td.title { max-width: 460px; }
+.bills td.last-action { max-width: 240px; font-size: 0.88rem; }
+.result .last b { color: var(--fg); font-weight: 600; }
+@media (max-width: 720px) { .bills td.author { display: inline-block; width: auto; margin-left: 8px; } }

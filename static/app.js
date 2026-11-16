@@ -79,6 +79,29 @@ function optionList(values, selected, labeler = cap) {
   return values.map((v) => `<option value="${esc(v)}"${v === selected ? " selected" : ""}>${esc(labeler(v))}</option>`).join("");
 }
 
+function summaryCell(r) {
+  if (r.summary) return `<p class="ai-summary">${esc(r.summary)}</p>`;
+  if (state.config.ai_available) return `<p class="ai-missing">No AI summary yet. <button class="linkish" type="button" data-summarize="${esc(r.bill)}">Summarize now</button></p>`;
+  return `<p class="ai-missing">AI summaries are off on this server.</p>`;
+}
+function officialTitle(r) {
+  return r.title ? `<p class="official-title">Official title: ${esc(r.title)}</p>` : "";
+}
+function bindSummarize(root) {
+  root.querySelectorAll("[data-summarize]").forEach((b) => b.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const bill = b.dataset.summarize;
+    const p = b.closest(".ai-missing");
+    p.textContent = "Reading the bill and writing a summary…";
+    try {
+      const s = await api(`/api/bill/${state.session}/${bill}/summary`, { method: "POST" });
+      [state.tracked, state.find.results].forEach((list) => list.forEach((r) => { if (r.bill === bill) r.summary = s.summary; }));
+      const out = document.createElement("p");
+      out.className = "ai-summary"; out.textContent = s.summary;
+      p.replaceWith(out);
+    } catch (err) { p.textContent = err.message; }
+  }));
+}
 function priorityById(id) { return state.config.agenda.find((p) => p.id === id); }
 function shortLabel(p) { return `${TF_SHORT[p.task_force] || p.task_force} ${p.number}`; }
 function agendaTags(list) {
@@ -209,7 +232,7 @@ async function pollStatus() {
   const bar = $("#statusbar");
   if (job.running) {
     const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
-    const what = { index: "Building search index", filings: "Looking for newly filed bills", refresh: "Checking tracked bills" }[job.kind] || "Working";
+    const what = { index: "Building search index", filings: "Looking for newly filed bills", refresh: "Checking tracked bills", summaries: "Writing AI summaries" }[job.kind] || "Working";
     bar.innerHTML = `${what}: ${esc(job.label || "starting")} (${job.done}/${job.total || "?"})<span class="bar"><i style="width:${pct}%"></i></span>`;
   } else {
     const parts = [];
@@ -218,7 +241,9 @@ async function pollStatus() {
     else if (s.bills) parts.push(`${s.bills.toLocaleString()} measures known`);
     parts.push(`tracked bills checked ${ago(s.last_auto_refresh || newestCheck())}`);
     if (s.closed) parts.push("this session has adjourned sine die");
+    if (s.summaries_waiting) parts.push(`${s.summaries_waiting >= 1000 ? "1,000+" : s.summaries_waiting} AI summar${s.summaries_waiting === 1 ? "y" : "ies"} queued`);
     bar.textContent = cap(parts.join(" · ")) + ".";
+    if (s.summary_error) bar.textContent += ` AI summaries paused: ${s.summary_error.error}`;
     if (job.error) bar.textContent += ` Last update failed: ${job.error}`;
   }
   ["#btn-refresh", "#btn-index", "#btn-filings"].forEach((b) => ($(b).disabled = !!job.running));
@@ -228,7 +253,8 @@ async function pollStatus() {
     if (!firstSeen) {
       await Promise.all([loadTracked(), loadUpdates(), loadSubjects(), loadAgenda(), loadSettings()]);
       if (currentView() === "find") runSearch(true);
-      let msg = { index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings" }[job.kind];
+      let msg = { index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
+        summaries: job.result ? `Wrote ${job.result.summarized} AI summar${job.result.summarized === 1 ? "y" : "ies"}` : "AI summaries updated" }[job.kind];
       if (job.kind === "filings" && job.result) {
         const r = job.result;
         msg = `${r.new_bills} new bill${r.new_bills === 1 ? "" : "s"} found, ${r.new_matches} agenda match${r.new_matches === 1 ? "" : "es"}` +
@@ -441,19 +467,21 @@ function renderMine() {
   $("#mine-table tbody").innerHTML = rows.map((t) => `
     <tr data-bill="${esc(t.bill)}">
       <td><span class="billno">${esc(t.display)}</span>${t.unseen ? `<span class="dot" title="${t.unseen} new action(s)"></span>` : ""}</td>
-      <td class="title"><div class="title-text">${esc(t.title || "Title not yet available")}</div>
+      <td class="author">${esc(t.author || "")}</td>
+      <td class="title">${summaryCell(t)}${officialTitle(t)}
         ${agendaTags(t.agenda)}
         ${t.labels ? `<div class="labels">${t.labels.split(",").map((l) => l.trim()).filter(Boolean).map((l) => `<span class="tag">${esc(l)}</span>`).join("")}</div>` : ""}</td>
+      <td class="last-action"><div>${esc(t.last_action || "")}</div><div class="date">${fmtDate(t.last_action_date)}</div></td>
       <td>${stagePill(t.stage, t.stage_label, closed)}</td>
-      <td><div>${esc(t.last_action || "")}</div><div class="date">${fmtDate(t.last_action_date)}</div></td>
       <td class="cell-pos"><select data-field="position" class="pos-${esc(t.position)}" aria-label="Position on ${esc(t.display)}">${optionList(state.config.positions, t.position)}</select></td>
       <td class="cell-pri"><select data-field="priority" aria-label="Priority for ${esc(t.display)}">${optionList(state.config.priorities, t.priority)}</select></td>
     </tr>`).join("");
   $("#mine-empty").hidden = state.tracked.length > 0;
   $("#mine-table").closest(".table-wrap").hidden = state.tracked.length === 0;
 
+  bindSummarize($("#mine-table tbody"));
   $("#mine-table tbody").querySelectorAll("tr").forEach((tr) => {
-    tr.addEventListener("click", (e) => { if (!e.target.closest("select")) openBill(state.session, tr.dataset.bill); });
+    tr.addEventListener("click", (e) => { if (!e.target.closest("select, button")) openBill(state.session, tr.dataset.bill); });
     tr.querySelectorAll("select").forEach((sel) => sel.addEventListener("change", async () => {
       await saveTracking(tr.dataset.bill, { [sel.dataset.field]: sel.value });
     }));
@@ -522,10 +550,11 @@ function renderResults() {
   $("#find-results").innerHTML = results.map((r) => `
     <li class="result">
       <div class="result-main" data-bill="${esc(r.bill)}">
-        <div class="result-top"><span class="billno">${esc(r.display)}</span>${stagePill(r.stage, r.stage_label, closed)}</div>
-        <p>${esc(r.title)}</p>
+        <div class="result-top"><span class="billno">${esc(r.display)}</span>${r.author ? `<span class="by">by ${esc(r.author)}</span>` : ""}${stagePill(r.stage, r.stage_label, closed)}</div>
+        ${summaryCell(r)}
+        <p class="last"><b>Last action:</b> ${esc(r.last_action || "No action recorded")}${r.last_action_date ? " · " + fmtDate(r.last_action_date) : ""}</p>
+        ${officialTitle(r)}
         ${agendaTags(r.agenda)}
-        <p class="last">Latest: ${esc(r.last_action || "No action recorded")}${r.last_action_date ? " · " + fmtDate(r.last_action_date) : ""}</p>
       </div>
       <div class="result-actions">${tracked.has(r.bill)
         ? `<span class="tracked-flag">Tracking</span>`
@@ -536,7 +565,8 @@ function renderResults() {
     b.disabled = true; b.textContent = "Adding…";
     if (!(await track(b.dataset.track))) { b.disabled = false; b.textContent = "Track"; }
   }));
-  $("#find-results").querySelectorAll(".result-main").forEach((el) => el.addEventListener("click", () => openBill(state.session, el.dataset.bill)));
+  bindSummarize($("#find-results"));
+  $("#find-results").querySelectorAll(".result-main").forEach((el) => el.addEventListener("click", (e) => { if (!e.target.closest("button")) openBill(state.session, el.dataset.bill); }));
 }
 
 // ------------------------------------------------------------------ updates
@@ -582,6 +612,30 @@ async function openBill(session, bill, refresh = false) {
   }
 }
 
+function aiBlock(d) {
+  const ai = d.ai;
+  if (ai && ai.summary) {
+    return `<h3 class="section-h">AI summary</h3><p class="ai-summary big">${esc(ai.summary)}</p>
+      <p class="ai-note">Written by Claude from the ${esc(ai.version || "latest")} text${ai.truncated ? " (long bill: summarized from the first part)" : ""}, ${ago(ai.created_at)}. Check the bill text before relying on it.
+      ${d.ai_available ? `<button class="linkish" type="button" id="ai-redo">Rewrite summary</button>` : ""}</p>`;
+  }
+  if (!d.ai_available) return `<h3 class="section-h">AI summary</h3><p class="ai-missing">AI summaries are off. Whoever runs the tracker needs to set ANTHROPIC_API_KEY.</p>`;
+  return `<h3 class="section-h">AI summary</h3><p class="ai-missing">${ai && ai.error ? esc(ai.error) + " " : ""}<button class="btn btn-sm" type="button" id="ai-redo">Summarize this bill</button></p>`;
+}
+function bindAi(d) {
+  const b = $("#ai-redo");
+  if (!b) return;
+  b.addEventListener("click", async () => {
+    b.disabled = true; b.textContent = "Reading the bill…";
+    try {
+      d.ai = await api(`/api/bill/${d.session}/${d.bill}/summary?force=${d.ai && d.ai.summary ? 1 : 0}`, { method: "POST" });
+      [state.tracked, state.find.results].forEach((list) => list.forEach((r) => { if (r.bill === d.bill) r.summary = d.ai.summary; }));
+      $("#d-ai").innerHTML = aiBlock(d); bindAi(d);
+      renderMine(); if (currentView() === "find") renderResults();
+    } catch (err) { toast(err.message, true); b.disabled = false; b.textContent = "Try again"; }
+  });
+}
+
 const KEY_ACTION = /passed|approved by governor|vetoed|sent to governor|do pass|engrossed|enrolled|became law|failed/i;
 
 function renderDrawer(d) {
@@ -609,6 +663,8 @@ function renderDrawer(d) {
         <span>Fetched ${ago(d.fetched_at)}${d.stale ? " (site unreachable, showing saved copy)" : ""}</span>
       </div>
     </div>
+
+    <div class="d-ai" id="d-ai">${aiBlock(d)}</div>
 
     ${agendaBlock ? `<div class="d-agenda"><h3 class="section-h" style="margin:0">OneVoice agenda</h3>${agendaBlock}</div>` : ""}
 
@@ -659,6 +715,7 @@ function renderDrawer(d) {
         : `<p class="hint">No versions, amendments, summaries or votes posted yet.</p>`}
     </div>`;
 
+  bindAi(d);
   if (t) {
     $("#t-position").addEventListener("change", (e) => saveTracking(d.bill, { position: e.target.value }));
     $("#t-priority").addEventListener("change", (e) => saveTracking(d.bill, { priority: e.target.value }));

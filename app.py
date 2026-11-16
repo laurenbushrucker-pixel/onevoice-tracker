@@ -24,6 +24,7 @@ from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
 import oklegis as ok
 import onevoice as ov
+import summarize as sm
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.environ.get("BILLTRACKER_DB", ROOT / "data" / "tracker.db"))
@@ -37,6 +38,9 @@ APP_URL = os.environ.get("BILLTRACKER_URL", "")  # public address, used for link
 # Default alert recipients until someone saves a list in the app (comma separated).
 DEFAULT_RECIPIENTS = [a.strip() for a in os.environ.get("BILLTRACKER_ALERT_TO", "").split(",") if a.strip()]
 DETAIL_MAX_AGE = timedelta(hours=6)
+# Which bills get AI summaries automatically: "agenda" (agenda matches and tracked bills), "tracked", or "all".
+SUMMARY_SCOPE = os.environ.get("BILLTRACKER_SUMMARY_SCOPE", "agenda")
+SUMMARY_BATCH = int(os.environ.get("BILLTRACKER_SUMMARY_BATCH", "40"))  # per background run
 
 POSITIONS = ["support", "oppose", "monitor", "neutral"]
 PRIORITIES = ["high", "medium", "low"]
@@ -82,6 +86,11 @@ CREATE TABLE IF NOT EXISTS matches (
   alert TEXT DEFAULT 'baseline',   -- baseline | pending | sent | skipped
   alerted_at TEXT,
   PRIMARY KEY (session, bill, priority_id));
+CREATE TABLE IF NOT EXISTS summaries (
+  session TEXT NOT NULL, bill TEXT NOT NULL,
+  summary TEXT, version TEXT, source_url TEXT, model TEXT, truncated INTEGER DEFAULT 0,
+  created_at TEXT, error TEXT,
+  PRIMARY KEY (session, bill));
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -102,7 +111,7 @@ def init_db() -> None:
     with db() as c:
         c.executescript(SCHEMA)
         cols = {r["name"] for r in c.execute("PRAGMA table_info(bills)")}
-        for col in ("first_seen", "matched_at"):
+        for col in ("first_seen", "matched_at", "author"):
             if col not in cols:  # upgrade a database made by an earlier version
                 c.execute(f"ALTER TABLE bills ADD COLUMN {col} TEXT")
         if not c.execute("SELECT 1 FROM priorities LIMIT 1").fetchone():
@@ -215,8 +224,9 @@ def send_alerts() -> dict:
     st = settings()
     with db() as c:
         rows = c.execute(
-            """SELECT m.session, m.bill, m.priority_id, m.keywords, b.title, b.last_action
+            """SELECT m.session, m.bill, m.priority_id, m.keywords, b.title, b.last_action, b.author, s.summary
                FROM matches m JOIN bills b ON b.session=m.session AND b.bill=m.bill
+               LEFT JOIN summaries s ON s.session=m.session AND s.bill=m.bill
                WHERE m.alert='pending' ORDER BY m.session, b.bill_type, b.bill_num"""
         ).fetchall()
     if not rows:
@@ -233,6 +243,7 @@ def send_alerts() -> dict:
         item = bills.setdefault(r["bill"], {
             "display": ok.display_bill(r["bill"]), "title": r["title"] or "",
             "url": ok.bill_url(r["bill"], r["session"]), "last_action": r["last_action"] or "", "priorities": [],
+            "author": r["author"] or "", "summary": r["summary"] or "",
         })
         p = pri.get(r["priority_id"])
         if p:
@@ -288,19 +299,26 @@ def store_detail(d: ok.BillDetail) -> list[ok.Action]:
         stage = ok.stage_from_actions(d.bill, d.actions)
         t, n = ok.split_bill(d.bill)
         c.execute(
-            """INSERT INTO bills(session,bill,bill_type,bill_num,title,last_action,last_action_date,stage,subjects,first_seen)
-               VALUES(?,?,?,?,?,?,?,?,'[]',?)
+            """INSERT INTO bills(session,bill,bill_type,bill_num,title,last_action,last_action_date,stage,subjects,first_seen,author)
+               VALUES(?,?,?,?,?,?,?,?,'[]',?,?)
                ON CONFLICT(session,bill) DO UPDATE SET
                  title=COALESCE(NULLIF(excluded.title,''),bills.title),
+                 author=COALESCE(NULLIF(excluded.author,''),bills.author),
                  matched_at=CASE WHEN COALESCE(bills.title,'')=COALESCE(NULLIF(excluded.title,''),bills.title,'') THEN bills.matched_at ELSE NULL END,
                  last_action=excluded.last_action, last_action_date=excluded.last_action_date,
                  stage=excluded.stage""",
-            (d.session, d.bill, t, n, d.title, last.action if last else "", last.date if last else None, stage, now_iso()),
+            (d.session, d.bill, t, n, d.title, last.action if last else "", last.date if last else None, stage, now_iso(),
+             author_text(d.author, d.other_author)),
         )
     if not prev:
         return []
     old = {(a["action"], a["date"], a["chamber"]) for a in json.loads(prev["data"]).get("actions", [])}
     return [a for a in d.actions if (a.action, a.date, a.chamber) not in old]
+
+
+def author_text(author: str, other: str) -> str:
+    """'Woods (S) and Newton (H)' style: primary author, then principal author in the other chamber."""
+    return " and ".join(a for a in (author, other) if a)
 
 
 def get_detail(session: str, bill: str, refresh: bool = False) -> dict | None:
@@ -360,6 +378,84 @@ def build_index(session: str, progress=None) -> int:
     return len(entries)
 
 
+# ------------------------------------------------------------- AI summaries
+
+
+def get_summary(session: str, bill: str) -> dict | None:
+    with db() as c:
+        r = c.execute("SELECT * FROM summaries WHERE session=? AND bill=?", (session, bill)).fetchone()
+    return dict(r) if r else None
+
+
+def summarize_bill(session: str, bill: str, force: bool = False) -> dict:
+    """Summarize the latest version of a bill's text. Skips work when the
+    stored summary already covers that version, unless force is set."""
+    detail = get_detail(session, bill)
+    if not detail:
+        raise sm.SummaryUnavailable(f"{ok.display_bill(bill)} was not found.")
+    version, url = sm.pick_version(detail)
+    have = get_summary(session, bill)
+    if have and have.get("summary") and have.get("source_url") == url and not force:
+        return have
+    try:
+        text = sm.bill_text(url) if url else ""
+    except Exception:  # noqa: BLE001 - fall back to the title when the PDF can't be read
+        text = ""
+    try:
+        summary, truncated = sm.summarize(ok.display_bill(bill), detail.get("title", ""), version, text)
+    except sm.SummaryUnavailable as e:
+        with db() as c:
+            c.execute("""INSERT INTO summaries(session,bill,error,created_at) VALUES(?,?,?,?)
+                         ON CONFLICT(session,bill) DO UPDATE SET error=excluded.error""", (session, bill, str(e), now_iso()))
+        raise
+    with db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO summaries(session,bill,summary,version,source_url,model,truncated,created_at,error) VALUES(?,?,?,?,?,?,?,?,NULL)",
+            (session, bill, summary, version, url, sm.MODEL, int(truncated), now_iso()),
+        )
+    return get_summary(session, bill)
+
+
+def summary_candidates(session: str, limit: int) -> list[str]:
+    scope = {
+        "tracked": "b.bill IN (SELECT bill FROM tracked WHERE session=b.session)",
+        "all": "1=1",
+    }.get(SUMMARY_SCOPE, "(b.bill IN (SELECT bill FROM tracked WHERE session=b.session) OR EXISTS (SELECT 1 FROM matches m WHERE m.session=b.session AND m.bill=b.bill))")
+    with db() as c:
+        rows = c.execute(
+            f"""SELECT b.bill FROM bills b LEFT JOIN summaries s ON s.session=b.session AND s.bill=b.bill
+                WHERE b.session=? AND {scope} AND (s.summary IS NULL) AND (s.error IS NULL OR s.created_at < ?)
+                ORDER BY (b.bill IN (SELECT bill FROM tracked WHERE session=b.session)) DESC, b.first_seen DESC, b.bill_type, b.bill_num
+                LIMIT ?""",
+            (session, (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(), limit),
+        ).fetchall()
+    return [r["bill"] for r in rows]
+
+
+def summarize_pending(session: str, progress=None, limit: int = SUMMARY_BATCH, bills: list[str] | None = None) -> dict:
+    if not sm.available():
+        return {"summarized": 0, "skipped": "no API key"}
+    todo = bills if bills is not None else summary_candidates(session, limit)
+    done, failed = 0, 0
+    for i, bill in enumerate(todo, 1):
+        if progress:
+            progress(i, len(todo), ok.display_bill(bill))
+        try:
+            summarize_bill(session, bill)
+            done += 1
+        except sm.SummaryUnavailable as e:
+            failed += 1
+            if "API key" in str(e) or "rate limit" in str(e):
+                meta_set("summary_error", {"at": now_iso(), "error": str(e)})
+                break
+        except RuntimeError:
+            failed += 1
+    if done:
+        meta_set("summary_error", None)
+    meta_set(f"summaries:{session}", {"at": now_iso(), "summarized": done, "failed": failed})
+    return {"summarized": done, "failed": failed}
+
+
 def probe_filings(session: str, progress=None) -> list[str]:
     """Find newly filed measures by trying the next unused bill numbers."""
     with db() as c:
@@ -391,6 +487,10 @@ def probe_filings(session: str, progress=None) -> list[str]:
 def check_filings(session: str, progress=None) -> dict:
     new = probe_filings(session, progress)
     created = match_session(session)
+    with db() as c:
+        alert_bills = [r["bill"] for r in c.execute(
+            "SELECT DISTINCT bill FROM matches WHERE session=? AND alert='pending'", (session,))]
+    summarize_pending(session, progress, bills=alert_bills)  # so the alert email can include summaries
     result = {"new_bills": len(new), "new_matches": created, **send_alerts()}
     meta_set(f"filings:{session}", {"at": now_iso(), **result})
     return result
@@ -447,6 +547,8 @@ def scheduler() -> None:
                         meta_set("last_auto_refresh", now_iso())
                 elif _due(f"indexed:{DEFAULT_SESSION}", INDEX_HOURS):
                     start_job("index", DEFAULT_SESSION, lambda p: build_index(DEFAULT_SESSION, p))
+                elif sm.available() and _due(f"summaries:{DEFAULT_SESSION}", 0.25) and summary_candidates(DEFAULT_SESSION, 1):
+                    start_job("summaries", DEFAULT_SESSION, lambda p: summarize_pending(DEFAULT_SESSION, p))
         except Exception:  # noqa: BLE001 - keep the scheduler alive
             pass
 
@@ -535,6 +637,9 @@ def api_config():
         agenda_name=ov.load_seed().get("name", "OneVoice agenda"),
         refresh_hours=REFRESH_HOURS,
         filings_hours=FILINGS_HOURS,
+        ai_available=sm.available(),
+        ai_model=sm.MODEL,
+        summary_scope=SUMMARY_SCOPE,
     )
 
 
@@ -552,6 +657,9 @@ def api_status():
         alerts_watch=s in ALERT_SESSIONS,
         job=dict(job),
         last_auto_refresh=meta_get("last_auto_refresh"),
+        summaries=meta_get(f"summaries:{s}"),
+        summary_error=meta_get("summary_error"),
+        summaries_waiting=len(summary_candidates(s, 1000)) if sm.available() else None,
     )
 
 
@@ -629,8 +737,9 @@ def api_search():
     with db() as c:
         total = c.execute(f"SELECT COUNT(*) n FROM bills b WHERE {sql_where}", args).fetchone()["n"]
         rows = c.execute(
-            f"""SELECT b.*, t.position AS tracked_position FROM bills b
+            f"""SELECT b.*, t.position AS tracked_position, s.summary, s.version AS summary_version FROM bills b
                 LEFT JOIN tracked t ON t.session=b.session AND t.bill=b.bill
+                LEFT JOIN summaries s ON s.session=b.session AND s.bill=b.bill
                 WHERE {sql_where} ORDER BY {order} LIMIT ? OFFSET ?""",
             args + [limit, offset],
         ).fetchall()
@@ -645,8 +754,9 @@ def api_search():
             match_session(s)
             with db() as c:
                 rows = c.execute(
-                    """SELECT b.*, t.position AS tracked_position FROM bills b
+                    """SELECT b.*, t.position AS tracked_position, s.summary, s.version AS summary_version FROM bills b
                        LEFT JOIN tracked t ON t.session=b.session AND t.bill=b.bill
+                       LEFT JOIN summaries s ON s.session=b.session AND s.bill=b.bill
                        WHERE b.session=? AND b.bill=?""",
                     (s, bill),
                 ).fetchall()
@@ -655,7 +765,8 @@ def api_search():
 
 
 TRACKED_SQL = """SELECT t.*, b.title, b.last_action, b.last_action_date, b.stage, b.subjects,
-                        b.bill_type, b.bill_num,
+                        b.bill_type, b.bill_num, b.author,
+                        (SELECT summary FROM summaries s WHERE s.session=t.session AND s.bill=t.bill) AS summary,
                         (SELECT COUNT(*) FROM updates u WHERE u.session=t.session AND u.bill=t.bill AND u.seen=0) AS unseen
                  FROM tracked t LEFT JOIN bills b ON b.session=t.session AND b.bill=t.bill"""
 
@@ -741,9 +852,34 @@ def api_bill(session, bill):
         tracked=dict(t) if t else None,
         subjects=json.loads(b["subjects"]) if b else [],
         agenda=agenda_for(session, [bill]).get(bill, []),
+        author_text=author_text(d.get("author", ""), d.get("other_author", "")),
+        ai=get_summary(session, bill),
+        ai_available=sm.available(),
     )
     d["stage_label"] = ok.STAGE_LABEL.get(d["stage"], "Unknown")
     return jsonify(d)
+
+
+@app.post("/api/bill/<session>/<bill>/summary")
+def api_summarize(session, bill):
+    bill = want_bill(bill)
+    try:
+        s = summarize_bill(session.upper(), bill, force=request.args.get("force") == "1")
+    except sm.SummaryUnavailable as e:
+        return jsonify(error=str(e)), 503
+    except RuntimeError as e:
+        abort(502, f"oklegislature.gov did not respond: {e}")
+    return jsonify(s)
+
+
+@app.post("/api/summaries")
+def api_summaries():
+    s = want_session()
+    if not sm.available():
+        return jsonify(error="AI summaries are off: set ANTHROPIC_API_KEY on the server."), 503
+    if not start_job("summaries", s, lambda p: summarize_pending(s, p)):
+        return jsonify(error=BUSY), 409
+    return jsonify(ok=True)
 
 
 @app.get("/api/updates")
@@ -901,11 +1037,11 @@ def api_export():
     rows = with_agenda(s, [bill_row(r) for r in rows])
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Bill", "Title", "OneVoice priorities", "Status", "Last action", "Last action date", "Position",
+    w.writerow(["Bill", "Author", "AI summary", "Title", "OneVoice priorities", "Status", "Last action", "Last action date", "Position",
                 "Priority", "Labels", "Notes", "Link"])
     for d in rows:
         tags = "; ".join(f"{pri[a['id']]['task_force']} #{pri[a['id']]['number']}" for a in d["agenda"] if a["id"] in pri)
-        w.writerow([d["display"], d["title"], tags, d["stage_label"], d["last_action"], d["last_action_date"] or "",
+        w.writerow([d["display"], d.get("author") or "", d.get("summary") or "", d["title"], tags, d["stage_label"], d["last_action"], d["last_action_date"] or "",
                     d["position"], d["priority"], d["labels"], d["notes"], d["url"]])
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename=onevoice-tracked-bills-{s}.csv"})
@@ -924,6 +1060,11 @@ def main(argv: list[str]) -> None:
         return
     if cmd == "refresh":
         print(f"Checked {refresh_tracked(None, say)} tracked bills.")
+        return
+    if cmd == "summaries":
+        s = argv[2] if len(argv) > 2 else DEFAULT_SESSION
+        n = int(argv[3]) if len(argv) > 3 else SUMMARY_BATCH
+        print(summarize_pending(s, say, limit=n))
         return
     if cmd == "filings":
         for s in ALERT_SESSIONS:

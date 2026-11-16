@@ -111,7 +111,9 @@ def render_alert(items: list[dict], app_url: str, session_name: str) -> tuple[st
 
     lines = [f"{n} newly filed bill{'s' if n != 1 else ''} in the {session_name} match{'' if n != 1 else 'es'} the OneVoice state agenda.", ""]
     for it in items:
-        lines.append(f"{it['display']}: {it['title']}")
+        lines.append(f"{it['display']}" + (f" (by {it['author']})" if it.get("author") else "") + f": {it['title']}")
+        if it.get("summary"):
+            lines.append(f"  AI summary: {it['summary']}")
         for p in it["priorities"]:
             lines.append(f"  - {p['task_force']} #{p['number']}: {p['title']} (matched: {', '.join(p['keywords'])})")
         lines.append(f"  {it['url']}")
@@ -133,7 +135,11 @@ def render_alert(items: list[dict], app_url: str, session_name: str) -> tuple[st
         rows.append(
             f'<tr><td style="padding:14px 0;border-bottom:1px solid #e3e7df">'
             f'<a href="{e(it["url"])}" style="font:600 15px Menlo,Consolas,monospace;color:#2f3a2c;text-decoration:none">{e(it["display"])}</a>'
-            f'<div style="font-size:15px;color:#1d241b;margin-top:2px">{e(it["title"])}</div>{pr}'
+            + (f' <span style="font-size:13px;color:#707a6c">by {e(it["author"])}</span>' if it.get("author") else "")
+            + (f'<div style="font-size:15px;color:#1d241b;margin-top:4px">{e(it["summary"])}</div>'
+               f'<div style="font-size:12px;color:#707a6c;margin-top:2px">AI summary &middot; Official title: {e(it["title"])}</div>'
+               if it.get("summary") else f'<div style="font-size:15px;color:#1d241b;margin-top:2px">{e(it["title"])}</div>')
+            + f'{pr}'
             + (f'<div style="font-size:12px;color:#707a6c;margin-top:4px">Latest: {e(it["last_action"])}</div>' if it.get("last_action") else "")
             + "</td></tr>"
         )

@@ -25,6 +25,28 @@ All bill data comes from **www.oklegislature.gov**.
 - **Search** a whole session by keyword, bill number, agenda item, subject,
   chamber or status. **Export** tracked bills to CSV.
 
+## AI summaries
+
+Each bill is shown with its number, author, a short AI summary and its last
+action. Summaries are written by Claude (`claude-opus-5-5`) from the newest
+version of the bill text on oklegislature.gov, in 2–3 neutral sentences. Shell
+bills (only a title and an effective date) are labeled as such. Summaries are
+rewritten when a new version of the bill is posted.
+
+- **Which bills:** by default, bills that match the agenda and bills you track
+  (`BILLTRACKER_SUMMARY_SCOPE=agenda`). Use `tracked` for fewer or `all` for
+  every bill. Any bill can be summarized on demand with **Summarize now**.
+- **Alert emails** include the summary for each new bill.
+- **Setup:** set `ANTHROPIC_API_KEY` (from https://console.anthropic.com) on
+  the server. Without it the tracker works normally and shows "AI summaries are
+  off".
+- **Cost:** roughly 2–4 cents per bill. Summarizing every agenda match over a
+  two-year legislature (about 1,300 bills in 2025–26) comes to roughly $30–50.
+- Requests ask for a fallback model if Claude declines a request
+  (`fallbacks: "default"`), so a summary still gets written.
+
+AI summaries can be wrong. Read the bill before taking a position.
+
 ## How alerts work
 
 1. **Finding new filings.** Oklahoma numbers bills in order (Senate bills from
@@ -95,6 +117,8 @@ account.
 | `BILLTRACKER_FILINGS_HOURS` | `1` | How often to look for new filings (`0` = off) |
 | `BILLTRACKER_REFRESH_HOURS` | `6` | How often tracked bills are re-checked (`0` = off) |
 | `BILLTRACKER_INDEX_HOURS` | `24` | How often the search index is rebuilt (`0` = off) |
+| `ANTHROPIC_API_KEY` | | Turns on AI summaries |
+| `BILLTRACKER_SUMMARY_SCOPE` | `agenda` | Which bills get summaries automatically: `agenda`, `tracked` or `all` |
 | `BILLTRACKER_ALERT_TO` | | Alert recipients, comma separated. Used until a list is saved in Alerts & settings. |
 | `BILLTRACKER_URL` | | Public address of the tracker, for links in emails (can also be set in the app) |
 | `BILLTRACKER_DB` | `data/tracker.db` | SQLite database location |
@@ -138,6 +162,7 @@ sharing the address.
 | File | Role |
 |---|---|
 | `agenda.json` | The 21 OneVoice state priorities with their starting keywords. |
+| `summarize.py` | Reads the bill PDF and asks Claude for the summary. |
 | `onevoice.py` | Keyword matching and the alert email. |
 | `oklegis.py` | Scraper for oklegislature.gov: the Subject Index, bill pages, and status from each bill's history. |
 | `app.py` | Web server, database, scheduler (filings, tracked bills, index) and API. |
