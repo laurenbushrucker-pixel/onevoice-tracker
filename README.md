@@ -152,6 +152,29 @@ Command-line tasks, useful with cron if you turn off the built-in schedule:
 
 ## Hosting
 
+### Render (recommended)
+
+The repository includes `render.yaml`, which sets everything up on
+[Render](https://render.com): an always-on server in Render's Ohio region, a
+1 GB disk for the database, and a health check.
+
+1. Sign in to Render with GitHub and allow it to see the `onevoice-tracker`
+   repository.
+2. Click **New > Blueprint**, pick the repository, and click **Apply**.
+3. Fill in the values Render asks for (password, alert address, email
+   settings, Anthropic API key). Leave `BILLTRACKER_URL` blank for now.
+4. When the deploy finishes, copy the address Render shows (like
+   `https://onevoice-tracker.onrender.com`), paste it into `BILLTRACKER_URL`
+   under **Environment**, and save. That makes the links in alert emails work.
+5. Open the address, sign in, go to **Alerts & settings**, and click **Send a
+   test email**.
+
+Cost: about $7/month for the Starter server plus about $0.25/month for the
+1 GB disk (Render's prices as of late 2026). The free tier won't work: it
+sleeps when idle, can't keep a disk, and blocks outgoing email.
+
+### Docker (any host)
+
 The included `Dockerfile` runs the tracker on any container host (Render,
 Railway, Fly.io, or a small cloud VM). Mount a persistent volume at
 `/app/data` so tracked bills and settings survive restarts, and set the email
