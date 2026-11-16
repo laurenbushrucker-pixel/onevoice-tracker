@@ -152,7 +152,51 @@ Command-line tasks, useful with cron if you turn off the built-in schedule:
 
 ## Hosting
 
-### Render (recommended)
+### Google Cloud free tier ($0)
+
+Google Cloud includes one small e2-micro server free each month in
+us-central1 (Iowa), us-west1 (Oregon) or us-east1 (South Carolina). The
+`deploy/gcp-setup.sh` script installs the tracker there with free HTTPS (via
+sslip.io and Let's Encrypt), starts it on every reboot, and updates it from
+GitHub each night at 4:30 a.m. Central.
+
+**1. Create the server** (console.cloud.google.com > Compute Engine > VM instances > Create instance)
+
+| Setting | Choose |
+|---|---|
+| Region | `us-central1`, `us-west1` or `us-east1` |
+| Machine type | `e2-micro` |
+| Boot disk | Debian 12, **Standard persistent disk**, 30 GB (Balanced and SSD disks are not free) |
+| Firewall | tick **Allow HTTP traffic** and **Allow HTTPS traffic** |
+
+Leave the external IP as the default (ephemeral). Reserving a static IP can
+cost money.
+
+**2. Install.** Click **SSH** next to the server, paste this whole block, and
+press Enter. It shows a key to add on GitHub (repository **Settings > Deploy
+keys > Add deploy key**, leave "Allow write access" unticked), then asks for
+your settings.
+
+```bash
+{
+sudo apt-get update -qq && sudo apt-get install -y -qq git >/dev/null
+[ -f ~/.ssh/onevoice ] || ssh-keygen -q -t ed25519 -N "" -f ~/.ssh/onevoice -C onevoice-server
+echo; echo "Add this key on GitHub: onevoice-tracker > Settings > Deploy keys > Add deploy key"; echo; cat ~/.ssh/onevoice.pub; echo
+read -r -p "Press Enter after you've added the key on GitHub... " _ </dev/tty
+[ -d ~/onevoice-tracker ] || GIT_SSH_COMMAND="ssh -i ~/.ssh/onevoice -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new" git clone -q -c core.sshCommand="ssh -i ~/.ssh/onevoice -o IdentitiesOnly=yes" git@github.com:laurenbushrucker-pixel/onevoice-tracker.git ~/onevoice-tracker
+bash ~/onevoice-tracker/deploy/gcp-setup.sh
+}
+```
+
+**Afterwards**
+
+- Change settings: `sudo nano /etc/onevoice-tracker.env`, then `sudo systemctl restart onevoice-tracker`. Or run the setup script again.
+- Update right away: `bash ~/onevoice-tracker/deploy/update.sh`
+- See the logs: `sudo journalctl -u onevoice-tracker -n 50`
+- If you stop and start the server, Google may give it a new IP address. Run `bash ~/onevoice-tracker/deploy/gcp-setup.sh` again and keep your settings; it moves the web address to the new IP.
+- Set a budget alert (Billing > Budgets & alerts, $1) so you'd hear about any charge.
+
+### Render (paid, simplest)
 
 The repository includes `render.yaml`, which sets everything up on
 [Render](https://render.com): an always-on server in Render's Ohio region, a

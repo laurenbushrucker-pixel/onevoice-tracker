@@ -707,7 +707,8 @@ def require_sign_in():
     if request.path in ("/login", "/healthz"):
         return None
     if not PASSWORD:
-        if os.environ.get("HOST", "127.0.0.1") in ("127.0.0.1", "localhost"):
+        required = os.environ.get("BILLTRACKER_REQUIRE_PASSWORD", "false") == "true"
+        if not required and os.environ.get("HOST", "127.0.0.1") in ("127.0.0.1", "localhost"):
             return None  # running only on this computer: no password needed
         msg = "Set BILLTRACKER_PASSWORD on the server to turn on sign-in. The tracker stays closed until then."
         if request.path.startswith("/api/"):
