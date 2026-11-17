@@ -9,6 +9,7 @@ import re
 import smtplib
 import ssl
 from email.message import EmailMessage
+from email.utils import formataddr, parseaddr
 from functools import lru_cache
 from pathlib import Path
 
@@ -44,6 +45,18 @@ def match_text(text: str, keywords: list[str]) -> list[str]:
 TEXT_MIN_HITS = int(os.environ.get("BILLTRACKER_TEXT_MIN_HITS", "3"))
 
 
+def _distinct_mentions(spans: set[tuple[int, int]]) -> int:
+    """Number of non-overlapping places in the text where any keyword was found."""
+    n, end = 0, -1
+    for start, stop in sorted(spans):
+        if start >= end:
+            n += 1
+            end = stop
+        else:
+            end = max(end, stop)
+    return n
+
+
 def match_bill(title: str, subjects: list[str], priorities: list[dict], text: str = "",
                min_hits: int = TEXT_MIN_HITS) -> list[tuple[str, list[str]]]:
     """[(priority_id, [evidence])] for every enabled priority the bill matches.
@@ -63,8 +76,13 @@ def match_bill(title: str, subjects: list[str], priorities: list[dict], text: st
         if match_text(head, p.get("exclude", [])):
             continue
         in_title = [k.strip() for k in kws if keyword_regex(k).search(head)]
-        counts = {k.strip(): len(keyword_regex(k).findall(text)) for k in kws} if text else {}
-        body_total = sum(counts.values())
+        counts, spans = {}, set()
+        if text:
+            for k in kws:
+                found = [m.span() for m in keyword_regex(k).finditer(text)]
+                counts[k.strip()] = len(found)
+                spans.update(found)
+        body_total = _distinct_mentions(spans)  # "Indian tribe" and "tribe*" in the same place count once
         if not in_title and body_total < min_hits:
             continue
         evidence = [f"{k} (title)" for k in in_title]
@@ -88,6 +106,7 @@ def smtp_settings() -> dict:
         "user": os.environ.get("SMTP_USER", ""),
         "password": os.environ.get("SMTP_PASSWORD", ""),
         "sender": os.environ.get("SMTP_FROM", "") or os.environ.get("SMTP_USER", ""),
+        "from_name": os.environ.get("BILLTRACKER_FROM_NAME", "ONEVOICE ALERT"),
         "security": os.environ.get("SMTP_SECURITY", "starttls").lower(),  # starttls | ssl | none
     }
 
@@ -105,7 +124,9 @@ def send_email(to: list[str], subject: str, text: str, html_body: str) -> None:
         raise EmailNotConfigured("No alert recipients. Add at least one address in Settings.")
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = s["sender"]
+    # Show a name instead of the bare address, e.g. "ONEVOICE ALERT <alerts@example.org>".
+    name, addr = parseaddr(s["sender"])
+    msg["From"] = formataddr((name or s["from_name"], addr or s["sender"]))
     msg["To"] = ", ".join(to)
     msg.set_content(text)
     msg.add_alternative(html_body, subtype="html")
@@ -143,6 +164,10 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
     subject = f"OneVoice Tracker: New {area_text} Bill Filed"
     author = item.get("author") or "Not listed yet"
     summary = item.get("summary") or ""
+    model = item.get("summary_model") or ""
+    source = ("AI summary" if model.startswith("claude") else
+              "Official staff summary" if model == "official" else
+              "From the bill's official description" if model == "caption" else "Summary")
     matches = [f"{p['task_force']} #{p['number']}: {p['title']}" for p in item["priorities"]]
 
     lines = [
@@ -152,8 +177,8 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
         f"Author: {author}",
         "Subject area: " + ("; ".join(matches) if matches else area_text),
         "",
-        "What it does (AI summary):",
-        summary or f"No AI summary available. Official title: {item['title']}",
+        f"What it does ({source}):",
+        summary or f"No summary available yet. Official title: {item['title']}",
         "",
         f"Official title: {item['title']}" if summary else "",
         f"Read the bill: {item['url']}",
@@ -161,7 +186,7 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
     if app_url:
         lines.append(f"Open the tracker: {app_url}#agenda")
     lines += ["", "Matched on: " + ", ".join(w for p in item["priorities"] for w in p["keywords"][:4]),
-              "Matches come from keywords in the bill's title and full text. AI summaries can be wrong; read the bill before taking a position.",
+              "Matches come from keywords in the bill's title and full text. Read the bill before taking a position.",
               "You are getting this because your address is on the OneVoice Tracker alert list."]
     text = "\n".join(l for l in lines if l is not None)
 
@@ -175,7 +200,7 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
     summary_html = (
         f'<div style="font-size:15px;line-height:1.5;color:#1d241b">{e(summary)}</div>'
         if summary else
-        '<div style="font-size:14px;color:#5d6659;font-style:italic">No AI summary available.</div>'
+        '<div style="font-size:14px;color:#5d6659;font-style:italic">No summary available yet.</div>'
     )
     tracker_button = (
         f'<a href="{e(app_url)}#agenda" style="display:inline-block;background:#5a9a28;color:#fff;padding:10px 16px;'
@@ -192,10 +217,10 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
 <tr><td {label}>Author</td><td {value}>{e(author)}</td></tr>
 <tr><td {label}>Subject area</td><td {value}>{area_rows}</td></tr>
 </table>
-<h2 style="font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#5d6659;margin:18px 0 6px">What it does &middot; AI summary</h2>
+<h2 style="font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#5d6659;margin:18px 0 6px">What it does &middot; {e(source)}</h2>
 {summary_html}
 <p style="font-size:12px;color:#707a6c;margin:10px 0 18px">Official title: {e(item['title'])}</p>
 <div>{tracker_button}<a href="{e(item['url'])}" style="display:inline-block;border:1px solid #c9d1c2;color:#2f3a2c;padding:9px 15px;border-radius:6px;text-decoration:none;font-weight:600;margin:0 0 8px">Read the bill</a></div>
-<p style="color:#8a9386;font-size:12px;margin-top:18px">Matched on: {e(", ".join(w for p in item["priorities"] for w in p["keywords"][:4]))}. Matches come from keywords in the bill's title and full text. AI summaries can be wrong; read the bill before taking a position. You are getting this because your address is on the OneVoice Tracker alert list.</p>
+<p style="color:#8a9386;font-size:12px;margin-top:18px">Matched on: {e(", ".join(w for p in item["priorities"] for w in p["keywords"][:4]))}. Matches come from keywords in the bill's title and full text. Read the bill before taking a position. You are getting this because your address is on the OneVoice Tracker alert list.</p>
 </td></tr></table></body></html>"""
     return subject, text, html_body

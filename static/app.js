@@ -80,10 +80,16 @@ function optionList(values, selected, labeler = cap) {
   return values.map((v) => `<option value="${esc(v)}"${v === selected ? " selected" : ""}>${esc(labeler(v))}</option>`).join("");
 }
 
+function summarySource(model) {
+  if (!model) return "";
+  if (model.startsWith("claude")) return "AI summary";
+  if (model === "official") return "Official staff summary";
+  if (model === "caption") return "From the bill's description";
+  return "Summary";
+}
 function summaryCell(r) {
-  if (r.summary) return `<p class="ai-summary">${esc(r.summary)}</p>`;
-  if (state.config.ai_available) return `<p class="ai-missing">No AI summary yet. <button class="linkish" type="button" data-summarize="${esc(r.bill)}">Summarize now</button></p>`;
-  return `<p class="ai-missing">AI summaries are off on this server.</p>`;
+  if (r.summary) return `<p class="ai-summary">${esc(r.summary)}</p>${r.summary_model ? `<p class="sum-source">${esc(summarySource(r.summary_model))}</p>` : ""}`;
+  return `<p class="ai-missing">No summary yet. <button class="linkish" type="button" data-summarize="${esc(r.bill)}">Get summary</button></p>`;
 }
 function officialTitle(r) {
   return r.title ? `<p class="official-title">Official title: ${esc(r.title)}</p>` : "";
@@ -93,13 +99,15 @@ function bindSummarize(root) {
     e.stopPropagation();
     const bill = b.dataset.summarize;
     const p = b.closest(".ai-missing");
-    p.textContent = "Reading the bill and writing a summary…";
+    p.textContent = "Getting the summary from oklegislature.gov…";
     try {
       const s = await api(`/api/bill/${state.session}/${bill}/summary`, { method: "POST" });
-      [state.tracked, state.find.results].forEach((list) => list.forEach((r) => { if (r.bill === bill) r.summary = s.summary; }));
+      [state.tracked, state.find.results].forEach((list) => list.forEach((r) => { if (r.bill === bill) { r.summary = s.summary; r.summary_model = s.model; } }));
       const out = document.createElement("p");
       out.className = "ai-summary"; out.textContent = s.summary;
-      p.replaceWith(out);
+      const src = document.createElement("p");
+      src.className = "sum-source"; src.textContent = summarySource(s.model);
+      p.replaceWith(out, src);
     } catch (err) { p.textContent = err.message; }
   }));
 }
@@ -233,7 +241,7 @@ async function pollStatus() {
   const bar = $("#statusbar");
   if (job.running) {
     const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
-    const what = { index: "Building search index", filings: "Looking for newly filed bills", refresh: "Checking tracked bills", summaries: "Writing AI summaries", texts: "Reading bill texts" }[job.kind] || "Working";
+    const what = { index: "Building search index", filings: "Looking for newly filed bills", refresh: "Checking tracked bills", summaries: "Getting bill summaries", texts: "Reading bill texts" }[job.kind] || "Working";
     bar.innerHTML = `${what}: ${esc(job.label || "starting")} (${job.done}/${job.total || "?"})<span class="bar"><i style="width:${pct}%"></i></span>`;
   } else {
     const parts = [];
@@ -242,9 +250,9 @@ async function pollStatus() {
     else if (s.bills) parts.push(`${s.bills.toLocaleString()} measures known`);
     parts.push(`tracked bills checked ${ago(s.last_auto_refresh || newestCheck())}`);
     if (s.closed) parts.push("this session has adjourned sine die");
-    if (s.summaries_waiting) parts.push(`${s.summaries_waiting >= 1000 ? "1,000+" : s.summaries_waiting} AI summar${s.summaries_waiting === 1 ? "y" : "ies"} queued`);
+    if (s.summaries_waiting) parts.push(`${s.summaries_waiting >= 1000 ? "1,000+" : s.summaries_waiting} summar${s.summaries_waiting === 1 ? "y" : "ies"} queued`);
     bar.textContent = cap(parts.join(" · ")) + ".";
-    if (s.summary_error) bar.textContent += ` AI summaries paused: ${s.summary_error.error}`;
+    
     if (job.error) bar.textContent += ` Last update failed: ${job.error}`;
   }
   ["#btn-refresh", "#btn-index", "#btn-filings"].forEach((b) => ($(b).disabled = !!job.running));
@@ -256,7 +264,7 @@ async function pollStatus() {
       if (currentView() === "find") runSearch(true);
       let msg = { index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
         texts: "Bill texts updated",
-        summaries: job.result ? `Wrote ${job.result.summarized} AI summar${job.result.summarized === 1 ? "y" : "ies"}` : "AI summaries updated" }[job.kind];
+        summaries: job.result ? `Updated ${job.result.summarized} summar${job.result.summarized === 1 ? "y" : "ies"}` : "Summaries updated" }[job.kind];
       if (job.kind === "filings" && job.result) {
         const r = job.result;
         msg = `${r.new_bills} new bill${r.new_bills === 1 ? "" : "s"} found, ${r.new_matches} agenda match${r.new_matches === 1 ? "" : "es"}` +
@@ -617,21 +625,25 @@ async function openBill(session, bill, refresh = false) {
 function aiBlock(d) {
   const ai = d.ai;
   if (ai && ai.summary) {
-    return `<h3 class="section-h">AI summary</h3><p class="ai-summary big">${esc(ai.summary)}</p>
-      <p class="ai-note">Written by Claude from the ${esc(ai.version || "latest")} text${ai.truncated ? " (long bill: summarized from the first part)" : ""}, ${ago(ai.created_at)}. Check the bill text before relying on it.
-      ${d.ai_available ? `<button class="linkish" type="button" id="ai-redo">Rewrite summary</button>` : ""}</p>`;
+    const m = ai.model || "";
+    const note = m.startsWith("claude")
+      ? `Written by Claude from the ${esc(ai.version || "latest")} text${ai.truncated ? " (long bill: summarized from the first part)" : ""}. AI summaries can be wrong; check the bill.`
+      : m === "official" ? `Written by legislative staff: ${esc(ai.version || "")}. Updated when a newer staff summary is posted.`
+      : `Taken from ${esc(ai.version || "the bill's official description")}. The tracker switches to the staff summary when one is posted.`;
+    return `<h3 class="section-h">${esc(summarySource(m) || "Summary")}</h3><p class="ai-summary big">${esc(ai.summary)}</p>
+      <p class="ai-note">${note} ${ai.source_url ? `<a href="${esc(ai.source_url)}" target="_blank" rel="noopener">Source</a> ·` : ""}
+      <button class="linkish" type="button" id="ai-redo">Check for an update</button></p>`;
   }
-  if (!d.ai_available) return `<h3 class="section-h">AI summary</h3><p class="ai-missing">AI summaries are off. Whoever runs the tracker needs to set ANTHROPIC_API_KEY.</p>`;
-  return `<h3 class="section-h">AI summary</h3><p class="ai-missing">${ai && ai.error ? esc(ai.error) + " " : ""}<button class="btn btn-sm" type="button" id="ai-redo">Summarize this bill</button></p>`;
+  return `<h3 class="section-h">Summary</h3><p class="ai-missing">${ai && ai.error ? esc(ai.error) + " " : ""}<button class="btn btn-sm" type="button" id="ai-redo">Get summary</button></p>`;
 }
 function bindAi(d) {
   const b = $("#ai-redo");
   if (!b) return;
   b.addEventListener("click", async () => {
-    b.disabled = true; b.textContent = "Reading the bill…";
+    b.disabled = true; b.textContent = "Checking oklegislature.gov…";
     try {
-      d.ai = await api(`/api/bill/${d.session}/${d.bill}/summary?force=${d.ai && d.ai.summary ? 1 : 0}`, { method: "POST" });
-      [state.tracked, state.find.results].forEach((list) => list.forEach((r) => { if (r.bill === d.bill) r.summary = d.ai.summary; }));
+      d.ai = await api(`/api/bill/${d.session}/${d.bill}/summary`, { method: "POST" });
+      [state.tracked, state.find.results].forEach((list) => list.forEach((r) => { if (r.bill === d.bill) { r.summary = d.ai.summary; r.summary_model = d.ai.model; } }));
       $("#d-ai").innerHTML = aiBlock(d); bindAi(d);
       renderMine(); if (currentView() === "find") renderResults();
     } catch (err) { toast(err.message, true); b.disabled = false; b.textContent = "Try again"; }

@@ -113,3 +113,51 @@ def summarize(display: str, title: str, version: str, text: str) -> tuple[str, b
     if not summary:
         raise SummaryUnavailable("The model returned an empty summary.")
     return summary, truncated
+
+
+# ------------------------------------------------------- free summaries
+# Without an API key, summaries come from oklegislature.gov itself: the
+# House or Senate staff's official bill summary when one is posted, and until
+# then the bill's own official description (its "An Act relating to ..." line).
+
+def pick_official_summary(detail: dict) -> tuple[str, str]:
+    """(label, url) of the newest staff bill summary, or ("", "")."""
+    docs = [d for d in detail.get("documents", [])
+            if d.get("group", "").startswith("Bill Summaries") and d.get("url")]
+    if not docs:
+        return "", ""
+    d = max(docs, key=lambda d: d.get("date") or "")
+    chamber = "House" if "(House)" in d["group"] else "Senate" if "(Senate)" in d["group"] else ""
+    return f"{chamber} staff summary ({d['name']})".strip(), d["url"]
+
+
+_SECTION_RE = re.compile(r"^\s*(Research Analysis|Bill Analysis|Analysis|Summary)\s*$", re.I | re.M)
+_END_RE = re.compile(r"^\s*(Prepared [Bb]y:|Fiscal Analysis|Other Considerations|©)", re.M)
+
+
+def official_summary_text(url: str) -> str:
+    """The analysis paragraph(s) from a House or Senate staff bill summary."""
+    text = bill_text(url)
+    m = _SECTION_RE.search(text)
+    body = text[m.end():] if m else text
+    end = _END_RE.search(body)
+    body = body[:end.start()] if end else body
+    body = re.sub(r"-\n(?=[a-z])", "", body)          # re-join hyphenated words
+    body = re.sub(r"\s*\n\s*", " ", body).strip()
+    return body[:1500].rsplit(" ", 1)[0] + "…" if len(body) > 1500 else body
+
+
+def caption_summary(text: str, title: str) -> str:
+    """The bill's own description: its 'An Act relating to ...' clause."""
+    m = re.search(r"\bAn Act\b(.*?)(BE IT ENACTED|$)", text or "", re.S | re.I)
+    cap = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+    cap = re.sub(r"-\s(?=[a-z])", "", cap)
+    if not cap or len(cap) < 20:
+        cap = title or ""
+    else:
+        cap = "Relating to " + re.sub(r"^relating to\s*", "", cap, flags=re.I)
+    cap = cap[:1200].rsplit(" ", 1)[0] + "…" if len(cap) > 1200 else cap
+    sections = len(re.findall(r"\bSECTION \d+\.", text or ""))
+    if text and sections <= 2 and len(text) < 2500 and re.search(r"noncodif", text, re.I):
+        cap += " (This looks like a shell bill: it names the act but has no detailed provisions yet.)"
+    return cap

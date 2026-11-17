@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS matches (
 CREATE TABLE IF NOT EXISTS summaries (
   session TEXT NOT NULL, bill TEXT NOT NULL,
   summary TEXT, version TEXT, source_url TEXT, model TEXT, truncated INTEGER DEFAULT 0,
-  created_at TEXT, error TEXT,
+  created_at TEXT, checked_at TEXT, error TEXT,
   PRIMARY KEY (session, bill));
 CREATE TABLE IF NOT EXISTS texts (
   session TEXT NOT NULL, bill TEXT NOT NULL,
@@ -142,6 +142,8 @@ def init_db() -> None:
         for col in ("first_seen", "matched_at", "author"):
             if col not in cols:  # upgrade a database made by an earlier version
                 c.execute(f"ALTER TABLE bills ADD COLUMN {col} TEXT")
+        if "checked_at" not in {r["name"] for r in c.execute("PRAGMA table_info(summaries)")}:
+            c.execute("ALTER TABLE summaries ADD COLUMN checked_at TEXT")
         if not c.execute("SELECT 1 FROM priorities LIMIT 1").fetchone():
             seed_priorities(c)
 
@@ -334,7 +336,7 @@ def send_alerts(only: tuple[str, str] | None = None) -> dict:
     extra, args = ("AND m.session=? AND m.bill=?", list(only)) if only else ("", [])
     with db() as c:
         rows = c.execute(
-            f"""SELECT m.session, m.bill, m.priority_id, m.keywords, b.title, b.last_action, b.author, s.summary
+            f"""SELECT m.session, m.bill, m.priority_id, m.keywords, b.title, b.last_action, b.author, s.summary, s.model AS summary_model
                FROM matches m JOIN bills b ON b.session=m.session AND b.bill=m.bill
                LEFT JOIN summaries s ON s.session=m.session AND s.bill=m.bill
                WHERE m.alert='pending' {extra} ORDER BY m.session, b.bill_type, b.bill_num""", args
@@ -354,7 +356,7 @@ def send_alerts(only: tuple[str, str] | None = None) -> dict:
         item = bills.setdefault(r["bill"], {
             "display": ok.display_bill(r["bill"]), "title": r["title"] or "",
             "url": ok.bill_url(r["bill"], r["session"]), "last_action": r["last_action"] or "", "priorities": [],
-            "author": r["author"] or "", "summary": r["summary"] or "",
+            "author": r["author"] or "", "summary": r["summary"] or "", "summary_model": r["summary_model"] or "",
         })
         p = pri.get(r["priority_id"])
         if p:
@@ -501,50 +503,88 @@ def get_summary(session: str, bill: str) -> dict | None:
 
 
 def summarize_bill(session: str, bill: str, force: bool = False) -> dict:
-    """Summarize the latest version of a bill's text. Skips work when the
-    stored summary already covers that version, unless force is set."""
+    """Write or refresh a bill's summary.
+
+    Free sources first (no API key needed), from oklegislature.gov:
+      1. the House or Senate staff's official bill summary, when posted;
+      2. until then, the bill's own official description ("An Act relating to ...").
+    With an Anthropic API key, Claude writes the summary from the bill text instead.
+    Skips work when the stored summary already covers the current source.
+    """
     detail = get_detail(session, bill)
     if not detail:
         raise sm.SummaryUnavailable(f"{ok.display_bill(bill)} was not found.")
-    version, url = sm.pick_version(detail)
     have = get_summary(session, bill)
-    if have and have.get("summary") and have.get("source_url") == url and not force:
-        return have
-    version, url, text = get_text(session, bill, detail=detail)
-    try:
-        summary, truncated = sm.summarize(ok.display_bill(bill), detail.get("title", ""), version, text)
-    except sm.SummaryUnavailable as e:
-        with db() as c:
-            c.execute("""INSERT INTO summaries(session,bill,error,created_at) VALUES(?,?,?,?)
-                         ON CONFLICT(session,bill) DO UPDATE SET error=excluded.error""", (session, bill, str(e), now_iso()))
-        raise
     with db() as c:
-        c.execute(
-            "INSERT OR REPLACE INTO summaries(session,bill,summary,version,source_url,model,truncated,created_at,error) VALUES(?,?,?,?,?,?,?,?,NULL)",
-            (session, bill, summary, version, url, sm.MODEL, int(truncated), now_iso()),
-        )
+        c.execute("UPDATE summaries SET checked_at=? WHERE session=? AND bill=?", (now_iso(), session, bill))
+
+    if sm.available():
+        version, url = sm.pick_version(detail)
+        if have and have.get("summary") and have.get("source_url") == url and (have.get("model") or "").startswith("claude") and not force:
+            return have
+        version, url, text = get_text(session, bill, detail=detail)
+        summary = None
+        try:
+            summary, truncated = sm.summarize(ok.display_bill(bill), detail.get("title", ""), version, text)
+        except sm.SummaryUnavailable as e:
+            meta_set("summary_error", {"at": now_iso(), "error": str(e)})  # fall back to the free summary
+        if summary:
+            _save_summary(session, bill, summary, version, url, sm.MODEL, truncated)
+            return get_summary(session, bill)
+
+    # Free path.
+    label, url = sm.pick_official_summary(detail)
+    if url:
+        if have and have.get("source_url") == url and have.get("summary") and not force:
+            return have
+        try:
+            text = sm.official_summary_text(url)
+        except Exception:  # noqa: BLE001 - fall back to the bill's description
+            text = ""
+        if len(text) > 40:
+            _save_summary(session, bill, text, label, url, "official", False)
+            return get_summary(session, bill)
+    version, text_url, text = get_text(session, bill, detail=detail)
+    if have and have.get("model") == "caption" and have.get("source_url") == text_url and have.get("summary") and not force:
+        return have
+    _save_summary(session, bill, sm.caption_summary(text, detail.get("title", "")),
+                  f"the bill's official description ({version or 'latest version'})", text_url, "caption", False)
     return get_summary(session, bill)
 
 
+def _save_summary(session, bill, summary, version, url, model, truncated) -> None:
+    with db() as c:
+        c.execute(
+            """INSERT OR REPLACE INTO summaries(session,bill,summary,version,source_url,model,truncated,created_at,checked_at,error)
+               VALUES(?,?,?,?,?,?,?,?,?,NULL)""",
+            (session, bill, summary, version, url, model, int(truncated), now_iso(), now_iso()),
+        )
+
+
 def summary_candidates(session: str, limit: int) -> list[str]:
+    """Bills that need a summary, then bills showing the bill's description
+    (re-checked every 12 hours for their first 45 days, until staff post a summary)."""
     scope = {
         "tracked": "b.bill IN (SELECT bill FROM tracked WHERE session=b.session)",
         "all": "1=1",
     }.get(SUMMARY_SCOPE, "(b.bill IN (SELECT bill FROM tracked WHERE session=b.session) OR EXISTS (SELECT 1 FROM matches m WHERE m.session=b.session AND m.bill=b.bill))")
+    now = datetime.now(timezone.utc)
     with db() as c:
         rows = c.execute(
             f"""SELECT b.bill FROM bills b LEFT JOIN summaries s ON s.session=b.session AND s.bill=b.bill
-                WHERE b.session=? AND {scope} AND (s.summary IS NULL) AND (s.error IS NULL OR s.created_at < ?)
-                ORDER BY (b.bill IN (SELECT bill FROM tracked WHERE session=b.session)) DESC, b.first_seen DESC, b.bill_type, b.bill_num
+                WHERE b.session=? AND {scope} AND (
+                    (s.summary IS NULL AND (s.error IS NULL OR s.created_at < ?))
+                 OR (s.model='caption' AND COALESCE(s.checked_at, s.created_at) < ? AND b.first_seen > ?))
+                ORDER BY (s.summary IS NULL) DESC, (b.bill IN (SELECT bill FROM tracked WHERE session=b.session)) DESC,
+                         b.first_seen DESC, b.bill_type, b.bill_num
                 LIMIT ?""",
-            (session, (datetime.now(timezone.utc) - timedelta(days=1)).isoformat(), limit),
+            (session, (now - timedelta(days=1)).isoformat(), (now - timedelta(hours=12)).isoformat(),
+             (now - timedelta(days=45)).isoformat(), limit),
         ).fetchall()
     return [r["bill"] for r in rows]
 
 
 def summarize_pending(session: str, progress=None, limit: int = SUMMARY_BATCH, bills: list[str] | None = None) -> dict:
-    if not sm.available():
-        return {"summarized": 0, "skipped": "no API key"}
     todo = bills if bills is not None else summary_candidates(session, limit)
     done, failed = 0, 0
     for i, bill in enumerate(todo, 1):
@@ -673,7 +713,7 @@ def scheduler() -> None:
                         meta_set("last_auto_refresh", now_iso())
                 elif _due(f"indexed:{DEFAULT_SESSION}", INDEX_HOURS):
                     start_job("index", DEFAULT_SESSION, lambda p: build_index(DEFAULT_SESSION, p))
-                elif sm.available() and _due(f"summaries:{DEFAULT_SESSION}", 0.25) and summary_candidates(DEFAULT_SESSION, 1):
+                elif _due(f"summaries:{DEFAULT_SESSION}", 0.25) and summary_candidates(DEFAULT_SESSION, 1):
                     start_job("summaries", DEFAULT_SESSION, lambda p: summarize_pending(DEFAULT_SESSION, p))
                 elif _due(f"texts:{DEFAULT_SESSION}", 0.1) and texts_missing(DEFAULT_SESSION):
                     start_job("texts", DEFAULT_SESSION, lambda p: fetch_texts(DEFAULT_SESSION, p))
@@ -895,7 +935,8 @@ def api_config():
         agenda_name=ov.load_seed().get("name", "OneVoice agenda"),
         refresh_hours=REFRESH_HOURS,
         filings_hours=FILINGS_HOURS,
-        ai_available=sm.available(),
+        ai_available=True,
+        claude_available=sm.available(),
         ai_model=sm.MODEL,
         summary_scope=SUMMARY_SCOPE,
     )
@@ -919,7 +960,7 @@ def api_status():
         texts_missing=texts_missing(s),
         filings_minutes=FILINGS_MINUTES,
         summary_error=meta_get("summary_error"),
-        summaries_waiting=len(summary_candidates(s, 1000)) if sm.available() else None,
+        summaries_waiting=len(summary_candidates(s, 1000)),
     )
 
 
@@ -997,7 +1038,7 @@ def api_search():
     with db() as c:
         total = c.execute(f"SELECT COUNT(*) n FROM bills b WHERE {sql_where}", args).fetchone()["n"]
         rows = c.execute(
-            f"""SELECT b.*, t.position AS tracked_position, s.summary, s.version AS summary_version FROM bills b
+            f"""SELECT b.*, t.position AS tracked_position, s.summary, s.version AS summary_version, s.model AS summary_model FROM bills b
                 LEFT JOIN tracked t ON t.session=b.session AND t.bill=b.bill
                 LEFT JOIN summaries s ON s.session=b.session AND s.bill=b.bill
                 WHERE {sql_where} ORDER BY {order} LIMIT ? OFFSET ?""",
@@ -1014,7 +1055,7 @@ def api_search():
             match_session(s)
             with db() as c:
                 rows = c.execute(
-                    """SELECT b.*, t.position AS tracked_position, s.summary, s.version AS summary_version FROM bills b
+                    """SELECT b.*, t.position AS tracked_position, s.summary, s.version AS summary_version, s.model AS summary_model FROM bills b
                        LEFT JOIN tracked t ON t.session=b.session AND t.bill=b.bill
                        LEFT JOIN summaries s ON s.session=b.session AND s.bill=b.bill
                        WHERE b.session=? AND b.bill=?""",
@@ -1027,6 +1068,7 @@ def api_search():
 TRACKED_SQL = """SELECT t.*, b.title, b.last_action, b.last_action_date, b.stage, b.subjects,
                         b.bill_type, b.bill_num, b.author,
                         (SELECT summary FROM summaries s WHERE s.session=t.session AND s.bill=t.bill) AS summary,
+                        (SELECT model FROM summaries s WHERE s.session=t.session AND s.bill=t.bill) AS summary_model,
                         (SELECT COUNT(*) FROM updates u WHERE u.session=t.session AND u.bill=t.bill AND u.seen=0) AS unseen
                  FROM tracked t LEFT JOIN bills b ON b.session=t.session AND b.bill=t.bill"""
 
@@ -1114,7 +1156,8 @@ def api_bill(session, bill):
         agenda=agenda_for(session, [bill]).get(bill, []),
         author_text=author_text(d.get("author", ""), d.get("other_author", "")),
         ai=get_summary(session, bill),
-        ai_available=sm.available(),
+        ai_available=True,
+        claude_available=sm.available(),
     )
     d["stage_label"] = ok.STAGE_LABEL.get(d["stage"], "Unknown")
     return jsonify(d)
@@ -1135,8 +1178,6 @@ def api_summarize(session, bill):
 @app.post("/api/summaries")
 def api_summaries():
     s = want_session()
-    if not sm.available():
-        return jsonify(error="AI summaries are off: set ANTHROPIC_API_KEY on the server."), 503
     if not start_job("summaries", s, lambda p: summarize_pending(s, p)):
         return jsonify(error=BUSY), 409
     return jsonify(ok=True)
@@ -1279,7 +1320,8 @@ def api_test_email():
     sample = {
         "display": "HB 0000", "author": "Example Author (H)",
         "title": "Schools; example title for a test alert; effective date.",
-        "summary": "Example only: no bill was filed. A real alert shows a 2-3 sentence AI summary here describing what the bill would do and who it affects.",
+        "summary": "Example only: no bill was filed. A real alert shows the House or Senate staff's official summary here, or the bill's own official description until staff post one.",
+        "summary_model": "official",
         "url": ok.BASE, "last_action": "",
         "priorities": [{"task_force": "Workforce and Talent Strategies", "number": 1,
                         "title": "Strengthen Public Education and Early Literacy", "keywords": ["schools"]}],

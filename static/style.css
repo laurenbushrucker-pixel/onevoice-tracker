@@ -283,3 +283,4 @@ select.pos-monitor { background: var(--monitor-bg); } select.pos-neutral { backg
 @media (max-width: 720px) { .bills td.author { display: inline-block; width: auto; margin-left: 8px; } }
 .signout { color: #fff; opacity: 0.8; font-size: 0.85rem; font-weight: 600; }
 .signout:hover { opacity: 1; }
+.sum-source { margin: 2px 0 0; color: var(--muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }

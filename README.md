@@ -25,29 +25,26 @@ All bill data comes from **www.oklegislature.gov**.
 - **Search** a whole session by keyword, bill number, agenda item, subject,
   chamber or status. **Export** tracked bills to CSV.
 
-## AI summaries
+## Bill summaries (free)
 
-Each bill is shown with its number, author, a short AI summary and its last
-action. Summaries are written by Claude (`claude-opus-5-5`) from the newest
-version of the bill text on oklegislature.gov, in 2–3 neutral sentences. Shell
-bills (only a title and an effective date) are labeled as such. Summaries are
-rewritten when a new version of the bill is posted.
+Each bill is shown with its number, author, a short summary and its last
+action. Summaries are free and come from oklegislature.gov:
 
-- **Which bills:** by default, bills that match the agenda and bills you track
-  (`BILLTRACKER_SUMMARY_SCOPE=agenda`). Use `tracked` for fewer or `all` for
-  every bill. Any bill can be summarized on demand with **Summarize now**.
-- **Alert emails** include the summary for each new bill.
-- **Setup:** set `ANTHROPIC_API_KEY` (from https://console.anthropic.com) on
-  the server. Without it the tracker works normally and shows "AI summaries are
-  off".
-- **Cost:** roughly 2–4 cents per bill. With full-text matching about 40% of
-  bills match at least one priority, so summarizing every match over a
-  two-year legislature (about 5,500 bills in 2025–26) comes to roughly
-  $50–100. Set a monthly spend limit in the Anthropic Console to cap it.
-- Requests ask for a fallback model if Claude declines a request
-  (`fallbacks: "default"`), so a summary still gets written.
+1. **Official staff summary.** House and Senate staff write a plain-English
+   summary for most bills, usually within a few days of filing. The tracker
+   uses the newest one.
+2. **The bill's official description.** Until staff post a summary, the
+   tracker shows the bill's own "An Act relating to ..." description, which
+   lists what the bill does. Shell bills (only a title and an effective date)
+   are labeled. Bills showing a description are re-checked every 12 hours for
+   their first 45 days and switch to the staff summary once it's posted.
 
-AI summaries can be wrong. Read the bill before taking a position.
+Each summary is labeled with its source on the website and in alert emails.
+
+**Optional AI summaries.** If you set `ANTHROPIC_API_KEY`, Claude
+(`claude-opus-5-5`) writes the summaries from the bill text instead, which
+gives an AI summary on filing day. This costs roughly 2–4 cents per bill. If
+the API call fails, the tracker falls back to the free summary.
 
 ## How alerts work
 
@@ -137,7 +134,8 @@ account.
 | `BILLTRACKER_REFRESH_HOURS` | `6` | How often tracked bills are re-checked (`0` = off) |
 | `BILLTRACKER_INDEX_HOURS` | `6` | How often the search index is rebuilt (`0` = off) |
 | `BILLTRACKER_PASSWORD` | | Team password for signing in (required on a server) |
-| `ANTHROPIC_API_KEY` | | Turns on AI summaries |
+| `ANTHROPIC_API_KEY` | | Optional: AI summaries instead of the free ones (paid) |
+| `BILLTRACKER_FROM_NAME` | `ONEVOICE ALERT` | Sender name shown on alert emails |
 | `BILLTRACKER_SUMMARY_SCOPE` | `agenda` | Which bills get summaries automatically: `agenda`, `tracked` or `all` |
 | `BILLTRACKER_ALERT_TO` | | Alert recipients, comma separated. Used until a list is saved in Alerts & settings. |
 | `BILLTRACKER_URL` | | Public address of the tracker, for links in emails (can also be set in the app) |
@@ -249,7 +247,7 @@ sharing the address.
 | File | Role |
 |---|---|
 | `agenda.json` | The 21 OneVoice state priorities with their starting keywords. |
-| `summarize.py` | Reads the bill PDF and asks Claude for the summary. |
+| `summarize.py` | Bill summaries: official staff summaries, the bill's description, or (optional) Claude. |
 | `onevoice.py` | Keyword matching and the alert email. |
 | `oklegis.py` | Scraper for oklegislature.gov: the Subject Index, bill pages, and status from each bill's history. |
 | `app.py` | Web server, database, scheduler (filings, tracked bills, index) and API. |
