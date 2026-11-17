@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import base64
 import hmac
 import secrets
 import zlib
@@ -385,11 +386,13 @@ def send_alerts(only: tuple[str, str] | None = None) -> dict:
             "display": ok.display_bill(r["bill"]), "title": r["title"] or "",
             "url": ok.bill_url(r["bill"], r["session"]), "last_action": r["last_action"] or "", "priorities": [],
             "author": r["author"] or "", "summary": r["summary"] or "", "summary_model": r["summary_model"] or "",
+            "progress": bill_progress(r["session"], r["bill"]),
         })
         p = pri.get(r["priority_id"])
         if p:
-            item["priorities"].append({"task_force": p["task_force"], "number": p["number"], "title": p["title"],
-                                       "keywords": json.loads(r["keywords"])})
+            item["priorities"].append({"id": p["id"], "task_force": p["task_force"], "number": p["number"], "title": p["title"],
+                                       "keywords": json.loads(r["keywords"]),
+                                       "review_links": review_links(st["app_url"], r["session"], r["bill"], p["id"])})
     sent = 0
     for session, bills in by_session.items():
         for bill, item in bills.items():  # one email per bill, titled with its policy area
@@ -518,6 +521,15 @@ def refresh_tracked(session: str | None = None, progress=None) -> int:
 CATEGORY_LABEL = dict(ok.ACTION_CATEGORIES)
 
 
+def bill_progress(session: str, bill: str) -> dict | None:
+    """Progress along the path to law, from the saved bill history."""
+    with db() as c:
+        row = c.execute("SELECT data FROM details WHERE session=? AND bill=?", (session, bill)).fetchone()
+    if not row:
+        return None
+    return ok.progress(bill, json.loads(row["data"]).get("actions", []), closed=ok.session_closed(session))
+
+
 def send_movement_emails() -> dict:
     """Email each tracked bill that has new actions of the kinds chosen in settings."""
     st = settings()
@@ -553,6 +565,7 @@ def send_movement_emails() -> dict:
             "stage_label": ok.STAGE_LABEL.get(r0["stage"] or "unknown", ""),
             "actions": [{"date": r["date"], "chamber": r["chamber"], "action": r["action"], "category_label": CATEGORY_LABEL.get(cat, "")}
                         for r, cat in items],
+            "progress": bill_progress(session, bill),
         }
         subject, text, html_body = ov.render_movement(item, st["app_url"])
         try:
@@ -1095,6 +1108,43 @@ BUSY = "Another update is already running. Try again when it finishes."
 # ------------------------------------------------------------------ routes
 
 
+# ------------------------------------------------- one-click review links
+
+REVIEW_LINK_DAYS = 120
+
+
+def _sign(payload: bytes) -> str:
+    if not app.secret_key:
+        app.secret_key = _secret_key()
+    return hmac.new(app.secret_key.encode(), payload, "sha256").hexdigest()[:32]
+
+
+def review_token(session: str, bill: str, pid: str, verdict: str) -> str:
+    exp = int((datetime.now(timezone.utc) + timedelta(days=REVIEW_LINK_DAYS)).timestamp())
+    payload = base64.urlsafe_b64encode(json.dumps([session, bill, pid, verdict, exp], separators=(",", ":")).encode()).decode().rstrip("=")
+    return f"{payload}.{_sign(payload.encode())}"
+
+
+def read_review_token(token: str) -> tuple[str, str, str, str] | None:
+    try:
+        payload, sig = token.rsplit(".", 1)
+        if not hmac.compare_digest(sig, _sign(payload.encode())):
+            return None
+        session, bill, pid, verdict, exp = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        if exp < datetime.now(timezone.utc).timestamp() or verdict not in ("relevant", "not_relevant"):
+            return None
+        return session, bill, pid, verdict
+    except Exception:  # noqa: BLE001 - any malformed token is simply invalid
+        return None
+
+
+def review_links(app_url: str, session: str, bill: str, pid: str) -> dict:
+    if not app_url:
+        return {}
+    base = app_url.rstrip("/")
+    return {v: f"{base}/r/{review_token(session, bill, pid, v)}" for v in ("relevant", "not_relevant")}
+
+
 # ------------------------------------------------------------------- sign-in
 
 _failures: dict[str, list[float]] = {}
@@ -1170,8 +1220,8 @@ def security_headers(resp):
 def require_sign_in():
     if not app.secret_key:
         app.secret_key = _secret_key()
-    if request.path in ("/login", "/healthz"):
-        return None
+    if request.path in ("/login", "/healthz") or request.path.startswith("/r/"):
+        return None  # /r/ links carry their own signature
     if not PASSWORD:
         required = os.environ.get("BILLTRACKER_REQUIRE_PASSWORD", "false") == "true"
         if not required and os.environ.get("HOST", "127.0.0.1") in ("127.0.0.1", "localhost"):
@@ -1473,6 +1523,7 @@ def api_bill(session, bill):
         subjects=json.loads(b["subjects"]) if b else [],
         agenda=agenda_for(session, [bill]).get(bill, []),
         author_text=author_text(d.get("author", ""), d.get("other_author", "")),
+        progress=ok.progress(bill, d.get("actions", []), closed=ok.session_closed(session)),
         ai=get_summary(session, bill),
         ai_available=True,
         claude_available=sm.available(),
@@ -1621,6 +1672,71 @@ def api_review():
     return jsonify(ok=True, verdict=verdict)
 
 
+REVIEW_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex">
+<title>OneVoice Tracker</title>
+<style>
+:root{--bg:#f4f5f2;--card:#fff;--fg:#1e231d;--muted:#5d6659;--line:#d7dcd2;--yes:#1f7a4d;--no:#b3261e;color-scheme:light}
+@media (prefers-color-scheme:dark){:root{--bg:#121512;--card:#1a1f1a;--fg:#e7ece4;--muted:#9ea896;--line:#2f362d;--yes:#6fd3a0;--no:#ff9a91;color-scheme:dark}}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:24px 16px}
+.card{background:var(--card);border:1px solid var(--line);border-top:5px solid #76b82a;border-radius:8px;padding:28px;max-width:420px;width:100%}
+.big{font-size:1.4rem;font-weight:700;margin:0 0 6px} .yes{color:var(--yes)} .no{color:var(--no)} p{margin:0;color:var(--muted)}
+button{font:inherit;font-weight:600;border:0;border-radius:6px;padding:10px 16px;background:#4f8a1e;color:#fff;cursor:pointer;margin-top:14px}
+</style></head><body><div class="card" id="card">
+<p class="big">Saving your answer…</p><p>%BILL% · %PRIORITY%</p>
+<noscript><form method="post"><button type="submit">Confirm: %LABEL%</button></form></noscript>
+</div>
+<script>
+// Recorded by the browser, not by the page load, so email security scanners that
+// open links in advance can't mark bills by accident.
+fetch(location.pathname, {method: "POST"}).then(r => r.json()).then(d => {
+  document.getElementById("card").innerHTML = d.ok
+    ? '<p class="big ' + (d.verdict === "relevant" ? 'yes">✓ Marked relevant' : 'no">✕ Marked not relevant') + '</p><p>%BILL% · %PRIORITY%</p><p style="margin-top:10px">You can close this tab. Clicked the wrong one? Use the other button in the email.</p>'
+    : '<p class="big">This link has expired</p><p>Open OneVoice Tracker to mark this bill.</p>';
+}).catch(() => { document.getElementById("card").innerHTML = '<p class="big">Couldn’t save</p><p>Check your connection and click the link again.</p>'; });
+</script></body></html>"""
+
+
+def _review_target(token: str):
+    t = read_review_token(token)
+    if not t:
+        return None, None
+    session, bill, pid, verdict = t
+    p = next((x for x in get_priorities() if x["id"] == pid), None)
+    label = f"{p['task_force']} #{p['number']}" if p else pid
+    return t, label
+
+
+@app.get("/r/<token>")
+def review_link_page(token):
+    import html as _html
+    t, label = _review_target(token)
+    if not t:
+        return Response("<p style='font-family:sans-serif;padding:24px'>This link has expired or isn't valid. "
+                        "Open OneVoice Tracker to mark this bill.</p>", status=404, mimetype="text/html")
+    session, bill, pid, verdict = t
+    body = (REVIEW_PAGE.replace("%BILL%", _html.escape(ok.display_bill(bill)))
+            .replace("%PRIORITY%", _html.escape(label))
+            .replace("%LABEL%", "Relevant" if verdict == "relevant" else "Not relevant"))
+    return Response(body, mimetype="text/html", headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+@app.post("/r/<token>")
+def review_link_save(token):
+    t, _ = _review_target(token)
+    if not t:
+        return jsonify(ok=False), 404
+    session, bill, pid, verdict = t
+    with db() as c:
+        m = c.execute("SELECT keywords FROM matches WHERE session=? AND bill=? AND priority_id=?", (session, bill, pid)).fetchone()
+        c.execute("INSERT OR REPLACE INTO reviews(session,bill,priority_id,verdict,keywords,at) VALUES(?,?,?,?,?,?)",
+                  (session, bill, pid, verdict, m["keywords"] if m else "[]", now_iso()))
+    log_event("review_link", True, bill=bill, priority=pid, verdict=verdict)
+    if request.headers.get("Accept", "").startswith("text/html") or request.form:
+        return redirect(request.path)  # no-script form submit: show the page again
+    return jsonify(ok=True, verdict=verdict)
+
+
 @app.get("/api/agenda/<pid>/noise")
 def api_agenda_noise(pid):
     """Which keywords are behind bills marked Not relevant (and Relevant) for a priority."""
@@ -1721,9 +1837,12 @@ def api_test_email():
         "title": "Schools; example title for a test alert; effective date.",
         "summary": "Example only: no bill was filed. A real alert shows the House or Senate staff's official summary here, or the bill's own official description until staff post one.",
         "summary_model": "official",
+        "progress": ok.progress("HB1000", [{"action": "First Reading", "chamber": "H"},
+                                           {"action": "Second Reading referred to Common Education", "chamber": "H"}]),
         "url": ok.BASE, "last_action": "",
         "priorities": [{"task_force": "Workforce and Talent Strategies", "number": 1,
-                        "title": "Strengthen Public Education and Early Literacy", "keywords": ["schools"]}],
+                        "title": "Strengthen Public Education and Early Literacy", "keywords": ["schools (title)"],
+                        "review_links": {"relevant": (st["app_url"] or "").rstrip("/") + "/r/example", "not_relevant": (st["app_url"] or "").rstrip("/") + "/r/example"} if st["app_url"] else {}}],
     }
     subject, text, html_body = ov.render_alert(sample, st["app_url"], session_name(DEFAULT_SESSION))
     try:

@@ -75,6 +75,23 @@ the agenda counts but stay under "Marked not relevant". When you edit a
 priority's keywords, the tracker shows which keywords are behind the
 Not-relevant marks, so you know what to narrow.
 
+### One click from the email
+
+New-bill alert emails have **✓ Relevant** and **✕ Not relevant** buttons for
+each matching priority. One click records the answer with no sign-in; a small
+tab confirms it and can be closed. The links are signed (they can't be forged
+or edited), expire after 120 days, and only record when a real browser opens
+them, so email security scanners that open links in advance (such as
+Microsoft Defender) can't mark bills by accident.
+
+## Progress bar
+
+Alert emails and each bill's page show how far the bill has gone toward
+becoming law. Senate bills: Filed, Senate committee, Senate floor, House
+committee, House Oversight committee, House floor, Conference / final passage,
+Governor, Law (House bills start in the House). Only Law is 100%. Vetoed bills
+and bills left behind when the session ends are marked as such.
+
 ## Backups
 
 - Every morning the server saves a full copy of the database in

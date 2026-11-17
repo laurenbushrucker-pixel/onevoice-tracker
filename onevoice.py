@@ -157,6 +157,35 @@ def policy_areas(item: dict) -> list[str]:
     return out
 
 
+def progress_html(pr: dict | None) -> str:
+    """An email-safe progress bar (a one-row table, so Outlook draws it too)."""
+    if not pr:
+        return ""
+    e = html.escape
+    status = pr["status"]
+    fill = {"law": "#1f7a4d", "vetoed": "#b3261e", "failed": "#b3261e", "ended": "#8a9386"}.get(status, "#5a9a28")
+    cells = "".join(
+        f'<td style="height:12px;background:{fill if st["done"] else ("#f2d99a" if st["current"] else "#e3e7df")};'
+        f'border-right:2px solid #ffffff;font-size:0;line-height:0">&nbsp;</td>' for st in pr["steps"])
+    steps_text = " &rsaquo; ".join(
+        (f'<b style="color:#1d241b">{e(st["label"])}</b>' if st["current"] else
+         f'<span style="color:{"#3d4a3a" if st["done"] else "#9aa394"}">{"&#10003; " if st["done"] else ""}{e(st["label"])}</span>')
+        for st in pr["steps"])
+    return (f'<h2 style="font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#5d6659;margin:18px 0 6px">Progress</h2>'
+            f'<table role="presentation" width="100%" style="border-collapse:collapse"><tr>'
+            f'<td style="font-size:22px;font-weight:700;color:{fill};padding:0 12px 0 0;white-space:nowrap;width:1%">{pr["percent"]}%</td>'
+            f'<td style="font-size:14px;color:#1d241b">{e(pr["where"])}</td></tr></table>'
+            f'<table role="presentation" width="100%" style="border-collapse:collapse;margin:6px 0 6px;table-layout:fixed"><tr>{cells}</tr></table>'
+            f'<div style="font-size:11px;line-height:1.6;color:#5d6659">{steps_text}</div>')
+
+
+def progress_text(pr: dict | None) -> str:
+    if not pr:
+        return ""
+    return f"Progress: {pr['percent']}% ({pr['where']}). " + " > ".join(
+        ("[x] " if st["done"] else "[ ] ") + st["label"] for st in pr["steps"])
+
+
 def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str, str]:
     """One email for one newly filed bill.
 
@@ -180,11 +209,14 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
         f"Bill number: {item['display']}",
         f"Author: {author}",
         "Subject area: " + ("; ".join(matches) if matches else area_text),
+        *[f"  {p['task_force']} #{p['number']}: Relevant {p['review_links']['relevant']} | Not relevant {p['review_links']['not_relevant']}"
+          for p in item["priorities"] if p.get("review_links")],
         "",
         f"What it does ({source}):",
         summary or f"No summary available yet. Official title: {item['title']}",
         "",
         f"Official title: {item['title']}" if summary else "",
+        progress_text(item.get("progress")),
         f"Read the bill: {item['url']}",
     ]
     if app_url:
@@ -197,8 +229,17 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
     e = html.escape
     label = 'style="padding:8px 12px 8px 0;color:#5d6659;font-size:13px;white-space:nowrap;vertical-align:top;width:110px"'
     value = 'style="padding:8px 0;color:#1d241b;font-size:15px;vertical-align:top"'
+    def review_buttons(p):
+        links = p.get("review_links") or {}
+        if not links:
+            return ""
+        btn = ('display:inline-block;padding:5px 12px;border-radius:999px;text-decoration:none;font-size:13px;'
+               'font-weight:700;margin:6px 6px 2px 0;border:1px solid')
+        return (f'<div><a href="{e(links["relevant"])}" style="{btn} #1f7a4d;color:#1f7a4d;background:#dcf1e5">&#10003; Relevant</a>'
+                f'<a href="{e(links["not_relevant"])}" style="{btn} #b3261e;color:#b3261e;background:#f8dedb">&#10005; Not relevant</a></div>')
     area_rows = "".join(
-        f'<div><b style="color:#4f8a1e">{e(p["task_force"])} #{p["number"]}</b> &middot; {e(p["title"])}</div>'
+        f'<div style="margin-bottom:6px"><b style="color:#4f8a1e">{e(p["task_force"])} #{p["number"]}</b> &middot; {e(p["title"])}'
+        f'{review_buttons(p)}</div>'
         for p in item["priorities"]
     ) or e(area_text)
     summary_html = (
@@ -223,7 +264,9 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
 </table>
 <h2 style="font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#5d6659;margin:18px 0 6px">What it does &middot; {e(source)}</h2>
 {summary_html}
-<p style="font-size:12px;color:#707a6c;margin:10px 0 18px">Official title: {e(item['title'])}</p>
+<p style="font-size:12px;color:#707a6c;margin:10px 0 4px">Official title: {e(item['title'])}</p>
+{progress_html(item.get("progress"))}
+<div style="height:14px"></div>
 <div>{tracker_button}<a href="{e(item['url'])}" style="display:inline-block;border:1px solid #c9d1c2;color:#2f3a2c;padding:9px 15px;border-radius:6px;text-decoration:none;font-weight:600;margin:0 0 8px">Read the bill</a></div>
 <p style="color:#8a9386;font-size:12px;margin-top:18px">Matched on: {e(", ".join(w for p in item["priorities"] for w in p["keywords"][:4]))}. Matches come from keywords in the bill's title and full text. Read the bill before taking a position. You are getting this because your address is on the OneVoice Tracker alert list.</p>
 </td></tr></table></body></html>"""
@@ -267,6 +310,8 @@ def render_movement(item: dict, app_url: str) -> tuple[str, str, str]:
               f"Your position: {item.get('position', '').capitalize()}", f"Status: {item.get('stage_label', '')}"]
     if item.get("summary"):
         lines += ["", f"What it does: {item['summary']}"]
+    if item.get("progress"):
+        lines += ["", progress_text(item["progress"])]
     lines += ["", f"Read the bill: {item['url']}"] + ([f"Open the tracker: {app_url}#mine"] if app_url else [])
     lines += ["", "You are getting this because you track this bill in OneVoice Tracker."]
     rows = "".join(
@@ -285,6 +330,7 @@ def render_movement(item: dict, app_url: str) -> tuple[str, str, str]:
         f'<b>Your position:</b> <span style="color:{pos_color};font-weight:700">{e(pos.capitalize())}</span> &nbsp; '
         f'<b>Status:</b> {e(item.get("stage_label", ""))}</p>'
         + (f'<p style="font-size:14px;color:#3d4a3a;margin:8px 0 16px"><b>What it does:</b> {e(item["summary"])}</p>' if item.get("summary") else "")
+        + progress_html(item.get("progress")) + '<div style="height:14px"></div>'
         + f'<div>{_button(app_url + "#mine" if app_url else "", "Open OneVoice Tracker")}{_button(item["url"], "Read the bill", False)}</div>'
         + '<p style="color:#8a9386;font-size:12px;margin-top:18px">You are getting this because you track this bill in OneVoice Tracker. '
           'Choose which kinds of actions send email under Alerts &amp; settings.</p>' + _WRAP_END)

@@ -780,10 +780,11 @@ function renderDrawer(d) {
 
     ${agendaBlock ? `<div class="d-agenda"><h3 class="section-h" style="margin:0">OneVoice agenda</h3>${agendaBlock}</div>` : ""}
 
-    <div>
-      <div class="progress ${esc(d.stage)}">${STAGE_ORDER.map((_, i) => `<div class="${i <= reach ? "on" : ""}"></div>`).join("")}</div>
-      <div class="progress-labels">${PROGRESS_LABELS.map((l) => `<span>${l}</span>`).join("")}</div>
-    </div>
+    ${d.progress ? `<div class="prog">
+      <div class="prog-head"><span class="prog-pct st-${esc(d.progress.status)}">${d.progress.percent}%</span><span>${esc(d.progress.where)}</span></div>
+      <div class="prog-bar st-${esc(d.progress.status)}">${d.progress.steps.map((st) => `<i class="${st.done ? "on" : st.current ? "cur" : ""}" title="${esc(st.label)}"></i>`).join("")}</div>
+      <div class="prog-steps">${d.progress.steps.map((st) => `<span class="${st.done ? "on" : st.current ? "cur" : ""}">${st.done ? "✓ " : ""}${esc(st.label)}</span>`).join(" › ")}</div>
+    </div>` : ""}
 
     <div class="d-links">
       <a class="btn btn-ghost btn-sm" href="${esc(d.url)}" target="_blank" rel="noopener">Open on oklegislature.gov</a>

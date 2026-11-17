@@ -310,3 +310,15 @@ fieldset.group legend { font-weight: 700; font-family: var(--font-display); padd
 .kw-noise { font-size: 0.84rem; }
 .noise-kw { display: inline-block; background: var(--surface-2); border-radius: 4px; padding: 1px 6px; margin: 2px 2px 0 0; font-family: var(--font-mono); font-size: 0.78rem; }
 .noise-kw i { font-style: normal; color: var(--oppose); }
+
+/* progress toward law */
+.prog { display: flex; flex-direction: column; gap: 6px; }
+.prog-head { display: flex; gap: 10px; align-items: baseline; }
+.prog-pct { font-family: var(--font-display); font-size: 1.5rem; font-weight: 700; color: var(--brand); }
+.prog-pct.st-law { color: var(--support); } .prog-pct.st-vetoed, .prog-pct.st-failed { color: var(--oppose); } .prog-pct.st-ended { color: var(--muted); }
+.prog-bar { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr; gap: 3px; }
+.prog-bar i { height: 10px; background: var(--surface-2); border-radius: 2px; }
+.prog-bar i.on { background: var(--brand-bright); } .prog-bar i.cur { background: var(--monitor-bg); outline: 1px solid var(--monitor); }
+.prog-bar.st-law i.on { background: var(--support); } .prog-bar.st-vetoed i.on, .prog-bar.st-failed i.on { background: var(--oppose); } .prog-bar.st-ended i.on { background: var(--muted); }
+.prog-steps { font-size: 0.76rem; color: var(--muted); line-height: 1.6; }
+.prog-steps .on { color: var(--fg); } .prog-steps .cur { color: var(--fg); font-weight: 700; }
