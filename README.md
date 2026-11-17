@@ -40,8 +40,10 @@ rewritten when a new version of the bill is posted.
 - **Setup:** set `ANTHROPIC_API_KEY` (from https://console.anthropic.com) on
   the server. Without it the tracker works normally and shows "AI summaries are
   off".
-- **Cost:** roughly 2–4 cents per bill. Summarizing every agenda match over a
-  two-year legislature (about 1,300 bills in 2025–26) comes to roughly $30–50.
+- **Cost:** roughly 2–4 cents per bill. With full-text matching about 40% of
+  bills match at least one priority, so summarizing every match over a
+  two-year legislature (about 5,500 bills in 2025–26) comes to roughly
+  $50–100. Set a monthly spend limit in the Anthropic Console to cap it.
 - Requests ask for a fallback model if Claude declines a request
   (`fallbacks: "default"`), so a summary still gets written.
 
@@ -49,15 +51,20 @@ AI summaries can be wrong. Read the bill before taking a position.
 
 ## How alerts work
 
-1. **Finding new filings.** Oklahoma numbers bills in order (Senate bills from
-   1, House bills from 1001 in a legislature's first year). Each hour the
+1. **Finding new filings, fast.** Every 10 minutes (`BILLTRACKER_FILINGS_MINUTES`). Oklahoma numbers bills in order (Senate bills from
+   1, House bills from 1001 in a legislature's first year). The
    tracker tries the next unused numbers for every bill type (SB, HB, SJR, HJR,
    SCR, HCR, SR, HR) on oklegislature.gov. It also rebuilds the full index from
-   the Legislature's Subject Index once a day.
-2. **Matching.** Each new bill's short title (and subjects, once the
-   Legislature assigns them) is compared with every priority's keywords:
-   whole words, case-insensitive, with `*` meaning "any ending".
-3. **Emailing.** All new matches from one check go out in a single email. If
+   the Legislature's Subject Index every 6 hours as a safety net.
+2. **Matching.** The tracker downloads each new bill's full text from
+   oklegislature.gov and compares its title, subjects and text with every
+   priority's keywords (whole words, case-insensitive, `*` means "any
+   ending"). A keyword in the title counts on its own. In the bill text, a
+   priority's keywords must appear at least 3 times in total
+   (`BILLTRACKER_TEXT_MIN_HITS`), so a passing mention doesn't trigger an
+   alert. Each match records where the words were found, e.g.
+   "housing (title)" or "aircraft (bill text, 6x)".
+3. **Emailing.** Each matching bill is emailed the moment it's ready, with the subject "OneVoice Tracker: New [Policy Area] Bill Filed". If
    sending fails, the matches stay queued and are retried at the next check.
 
 The first check in a session records the bills already filed as a starting
@@ -125,9 +132,10 @@ account.
 |---|---|---|
 | `BILLTRACKER_SESSION` | `2700` | Session shown first and re-indexed daily (2700 = 2027 Regular Session) |
 | `BILLTRACKER_ALERT_SESSIONS` | same as above | Sessions whose new filings trigger email, comma separated |
-| `BILLTRACKER_FILINGS_HOURS` | `1` | How often to look for new filings (`0` = off) |
+| `BILLTRACKER_FILINGS_MINUTES` | `10` | How often to look for new filings (`0` = off) |
+| `BILLTRACKER_TEXT_MIN_HITS` | `3` | Keyword mentions needed in the bill text (title matches always count) |
 | `BILLTRACKER_REFRESH_HOURS` | `6` | How often tracked bills are re-checked (`0` = off) |
-| `BILLTRACKER_INDEX_HOURS` | `24` | How often the search index is rebuilt (`0` = off) |
+| `BILLTRACKER_INDEX_HOURS` | `6` | How often the search index is rebuilt (`0` = off) |
 | `BILLTRACKER_PASSWORD` | | Team password for signing in (required on a server) |
 | `ANTHROPIC_API_KEY` | | Turns on AI summaries |
 | `BILLTRACKER_SUMMARY_SCOPE` | `agenda` | Which bills get summaries automatically: `agenda`, `tracked` or `all` |
@@ -254,7 +262,6 @@ only file that needs updating. To load next year's agenda, edit
 
 ## Limits
 
-- Matching uses bill titles and subjects, not the full bill text.
 - Status labels are worked out from each bill's action history; the
   Legislature doesn't publish an official status.
 - The federal priorities in the OneVoice agenda aren't included, since this

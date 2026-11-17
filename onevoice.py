@@ -41,16 +41,36 @@ def match_text(text: str, keywords: list[str]) -> list[str]:
     return hits
 
 
-def match_bill(title: str, subjects: list[str], priorities: list[dict]) -> list[tuple[str, list[str]]]:
-    """[(priority_id, [matched keywords])] for every enabled priority the bill matches."""
-    text = " ".join([title or ""] + list(subjects or []))
+TEXT_MIN_HITS = int(os.environ.get("BILLTRACKER_TEXT_MIN_HITS", "3"))
+
+
+def match_bill(title: str, subjects: list[str], priorities: list[dict], text: str = "",
+               min_hits: int = TEXT_MIN_HITS) -> list[tuple[str, list[str]]]:
+    """[(priority_id, [evidence])] for every enabled priority the bill matches.
+
+    A keyword in the title or subjects is a match on its own. In the full bill
+    text, a priority's keywords must appear at least `min_hits` times in total,
+    so a bill that mentions a topic once in passing isn't flagged. Evidence
+    strings say where each word was found, e.g. "housing (title)" or
+    "affordable housing (bill text, 4x)". Exclusion words apply to the title.
+    """
+    head = " ".join([title or ""] + list(subjects or []))
     out = []
     for p in priorities:
         if not p.get("enabled", True):
             continue
-        hits = match_text(text, p.get("keywords", []))
-        if hits and not match_text(text, p.get("exclude", [])):
-            out.append((p["id"], hits))
+        kws = [k for k in p.get("keywords", []) if k.strip()]
+        if match_text(head, p.get("exclude", [])):
+            continue
+        in_title = [k.strip() for k in kws if keyword_regex(k).search(head)]
+        counts = {k.strip(): len(keyword_regex(k).findall(text)) for k in kws} if text else {}
+        body_total = sum(counts.values())
+        if not in_title and body_total < min_hits:
+            continue
+        evidence = [f"{k} (title)" for k in in_title]
+        evidence += [f"{k} (bill text, {n}x)" for k, n in sorted(counts.items(), key=lambda kv: -kv[1])
+                     if n and k not in in_title]
+        out.append((p["id"], evidence[:8]))
     return out
 
 
@@ -140,7 +160,8 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
     ]
     if app_url:
         lines.append(f"Open the tracker: {app_url}#agenda")
-    lines += ["", "AI summaries can be wrong; read the bill before taking a position.",
+    lines += ["", "Matched on: " + ", ".join(w for p in item["priorities"] for w in p["keywords"][:4]),
+              "Matches come from keywords in the bill's title and full text. AI summaries can be wrong; read the bill before taking a position.",
               "You are getting this because your address is on the OneVoice Tracker alert list."]
     text = "\n".join(l for l in lines if l is not None)
 
@@ -175,6 +196,6 @@ def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str,
 {summary_html}
 <p style="font-size:12px;color:#707a6c;margin:10px 0 18px">Official title: {e(item['title'])}</p>
 <div>{tracker_button}<a href="{e(item['url'])}" style="display:inline-block;border:1px solid #c9d1c2;color:#2f3a2c;padding:9px 15px;border-radius:6px;text-decoration:none;font-weight:600;margin:0 0 8px">Read the bill</a></div>
-<p style="color:#8a9386;font-size:12px;margin-top:18px">AI summaries can be wrong; read the bill before taking a position. You are getting this because your address is on the OneVoice Tracker alert list.</p>
+<p style="color:#8a9386;font-size:12px;margin-top:18px">Matched on: {e(", ".join(w for p in item["priorities"] for w in p["keywords"][:4]))}. Matches come from keywords in the bill's title and full text. AI summaries can be wrong; read the bill before taking a position. You are getting this because your address is on the OneVoice Tracker alert list.</p>
 </td></tr></table></body></html>"""
     return subject, text, html_body

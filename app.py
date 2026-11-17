@@ -22,6 +22,7 @@ from pathlib import Path
 
 import hmac
 import secrets
+import zlib
 
 from flask import Flask, Response, abort, jsonify, redirect, request, send_from_directory
 from flask import session as login_session
@@ -38,15 +39,20 @@ DEFAULT_SESSION = os.environ.get("BILLTRACKER_SESSION", "2700")
 # Sessions whose new filings trigger email alerts (comma separated).
 ALERT_SESSIONS = [s.strip().upper() for s in os.environ.get("BILLTRACKER_ALERT_SESSIONS", DEFAULT_SESSION).split(",") if s.strip()]
 REFRESH_HOURS = float(os.environ.get("BILLTRACKER_REFRESH_HOURS", "6"))  # 0 = off
-INDEX_HOURS = float(os.environ.get("BILLTRACKER_INDEX_HOURS", "24"))  # 0 = off
-FILINGS_HOURS = float(os.environ.get("BILLTRACKER_FILINGS_HOURS", "1"))  # 0 = off
+INDEX_HOURS = float(os.environ.get("BILLTRACKER_INDEX_HOURS", "6"))  # full index rebuild, the safety net; 0 = off
+# How often to look for newly filed bills. Speed is the point, so the default is every 10 minutes.
+FILINGS_MINUTES = float(os.environ.get("BILLTRACKER_FILINGS_MINUTES",
+                                       str(float(os.environ.get("BILLTRACKER_FILINGS_HOURS", "0")) * 60 or 10)))
+FILINGS_HOURS = FILINGS_MINUTES / 60  # 0 = off
+NEW_BILL_DAYS = 7  # a bill seen for the first time within this many days can still trigger an alert
+TEXT_BATCH = int(os.environ.get("BILLTRACKER_TEXT_BATCH", "60"))  # bill texts downloaded per background run
 APP_URL = os.environ.get("BILLTRACKER_URL", "")  # public address, used for links in emails
 # Default alert recipients until someone saves a list in the app (comma separated).
 DEFAULT_RECIPIENTS = [a.strip() for a in os.environ.get("BILLTRACKER_ALERT_TO", "").split(",") if a.strip()]
 DETAIL_MAX_AGE = timedelta(hours=6)
 # Which bills get AI summaries automatically: "agenda" (agenda matches and tracked bills), "tracked", or "all".
 SUMMARY_SCOPE = os.environ.get("BILLTRACKER_SUMMARY_SCOPE", "agenda")
-SUMMARY_BATCH = int(os.environ.get("BILLTRACKER_SUMMARY_BATCH", "40"))  # per background run
+SUMMARY_BATCH = int(os.environ.get("BILLTRACKER_SUMMARY_BATCH", "10"))  # per background run
 
 POSITIONS = ["support", "oppose", "monitor", "neutral"]
 PRIORITIES = ["high", "medium", "low"]
@@ -54,7 +60,8 @@ PRIORITIES = ["high", "medium", "low"]
 # Bill types probed for new filings, with the number each type starts at in
 # the first year of a legislature (House measures start at 1001).
 FILING_TYPES = {"SB": 1, "HB": 1001, "SJR": 1, "HJR": 1001, "SCR": 1, "HCR": 1001, "SR": 1, "HR": 1001}
-FILING_MISSES = 8  # stop probing a type after this many unused numbers in a row
+FILING_MISSES = 4        # stop probing a type after this many unused numbers in a row...
+FILING_MISSES_START = 8  # ...or this many, for a type with no bills yet this session
 
 app = Flask(__name__, static_folder=str(ROOT / "static"), static_url_path="/static")
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # for the development server; waitress handles this itself
@@ -107,6 +114,10 @@ CREATE TABLE IF NOT EXISTS summaries (
   session TEXT NOT NULL, bill TEXT NOT NULL,
   summary TEXT, version TEXT, source_url TEXT, model TEXT, truncated INTEGER DEFAULT 0,
   created_at TEXT, error TEXT,
+  PRIMARY KEY (session, bill));
+CREATE TABLE IF NOT EXISTS texts (
+  session TEXT NOT NULL, bill TEXT NOT NULL,
+  version TEXT, source_url TEXT, body BLOB, chars INTEGER, fetched_at TEXT, error TEXT,
   PRIMARY KEY (session, bill));
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
@@ -182,25 +193,38 @@ def get_priorities() -> list[dict]:
 # ---------------------------------------------------------- agenda matching
 
 
-def match_session(session: str, all_bills: bool = False) -> int:
-    """Match bills against the agenda.
+def match_session(session: str, all_bills: bool = False, fetch_text: bool = False) -> int:
+    """Match bills against the agenda, reading each bill's title, subjects and full text.
 
-    By default only bills not matched before (i.e. newly seen) are checked.
-    New matches on an alert session become 'pending' alerts once that
-    session's baseline exists; everything else is recorded as 'baseline' so
-    existing bills, or bills that only match after a keyword edit, never set
-    off a flood of email.
+    By default only bills not matched before (newly seen, or with new text)
+    are checked. A new match becomes a 'pending' alert only on an alert
+    session, after that session's starting point was recorded, and for a bill
+    first seen within the last NEW_BILL_DAYS. Everything else is recorded as
+    'baseline', so bills that already existed, or that only match after a
+    keyword edit, never set off a flood of email.
+
+    fetch_text downloads missing bill text first for recently seen bills, so a
+    new filing is judged on its full text before anyone is alerted.
     """
     priorities = get_priorities()
-    baseline_done = bool(meta_get(f"baseline:{session}"))
-    alertable = session in ALERT_SESSIONS and baseline_done and not all_bills
+    baseline = meta_get(f"baseline:{session}")
+    recent_cutoff = (datetime.now(timezone.utc) - timedelta(days=NEW_BILL_DAYS)).isoformat()
     ts = now_iso()
     created = 0
     with db() as c:
-        q = "SELECT bill, title, subjects FROM bills WHERE session=?" + ("" if all_bills else " AND matched_at IS NULL")
+        q = "SELECT bill, title, subjects, first_seen FROM bills WHERE session=?" + ("" if all_bills else " AND matched_at IS NULL")
         rows = c.execute(q, (session,)).fetchall()
-        for r in rows:
-            found = dict(ov.match_bill(r["title"] or "", json.loads(r["subjects"] or "[]"), priorities))
+    for r in rows:
+        recent = bool(baseline and r["first_seen"] and r["first_seen"] >= max(baseline, recent_cutoff))
+        if fetch_text and recent:
+            try:
+                get_text(session, r["bill"])
+            except RuntimeError:
+                pass
+        text = get_text(session, r["bill"], fetch=False)[2]
+        found = dict(ov.match_bill(r["title"] or "", json.loads(r["subjects"] or "[]"), priorities, text))
+        alert = "pending" if (session in ALERT_SESSIONS and recent and not all_bills) else "baseline"
+        with db() as c:
             existing = {m["priority_id"] for m in c.execute(
                 "SELECT priority_id FROM matches WHERE session=? AND bill=?", (session, r["bill"]))}
             for pid in existing - set(found):
@@ -213,13 +237,81 @@ def match_session(session: str, all_bills: bool = False) -> int:
                 else:
                     c.execute(
                         "INSERT INTO matches(session,bill,priority_id,keywords,matched_at,alert) VALUES(?,?,?,?,?,?)",
-                        (session, r["bill"], pid, json.dumps(kws), ts, "pending" if alertable else "baseline"),
+                        (session, r["bill"], pid, json.dumps(kws), ts, alert),
                     )
                     created += 1
             c.execute("UPDATE bills SET matched_at=? WHERE session=? AND bill=?", (ts, session, r["bill"]))
-    if not baseline_done:
+    if not baseline:
         meta_set(f"baseline:{session}", ts)
     return created
+
+
+# ---------------------------------------------------------------- bill text
+
+
+def store_text(session: str, bill: str, version: str, url: str, text: str, error: str | None = None) -> None:
+    with db() as c:
+        prev = c.execute("SELECT source_url FROM texts WHERE session=? AND bill=?", (session, bill)).fetchone()
+        c.execute(
+            "INSERT OR REPLACE INTO texts(session,bill,version,source_url,body,chars,fetched_at,error) VALUES(?,?,?,?,?,?,?,?)",
+            (session, bill, version, url, zlib.compress(text.encode("utf-8")), len(text), now_iso(), error),
+        )
+        if not prev or prev["source_url"] != url:
+            c.execute("UPDATE bills SET matched_at=NULL WHERE session=? AND bill=?", (session, bill))  # re-match on new text
+
+
+def get_text(session: str, bill: str, fetch: bool = True, detail: dict | None = None) -> tuple[str, str, str]:
+    """(version, url, text) of the newest version of the bill. Downloads it
+    when missing or when a newer version has been posted (if fetch is set)."""
+    with db() as c:
+        row = c.execute("SELECT version, source_url, body, error, fetched_at FROM texts WHERE session=? AND bill=?",
+                        (session, bill)).fetchone()
+    have = (row["version"] or "", row["source_url"] or "", zlib.decompress(row["body"]).decode("utf-8")) if row and row["body"] else None
+    if not fetch:
+        return have or ("", "", "")
+    if detail is None:
+        detail = get_detail(session, bill)
+    if not detail:
+        return have or ("", "", "")
+    version, url = sm.pick_version(detail)
+    if have and have[1] == url and (have[2] or not row["error"]):
+        return have
+    if not url:
+        return have or ("", "", "")
+    try:
+        text = sm.bill_text(url)
+        store_text(session, bill, version, url, text)
+    except Exception as e:  # noqa: BLE001 - keep the title-only match; retry on a later run
+        store_text(session, bill, version, url, "", error=str(e)[:300])
+        text = ""
+    return version, url, text
+
+
+def fetch_texts(session: str, progress=None, limit: int = TEXT_BATCH) -> dict:
+    """Background job: download text for bills that don't have it yet, newest first."""
+    with db() as c:
+        rows = c.execute(
+            """SELECT b.bill FROM bills b LEFT JOIN texts t ON t.session=b.session AND t.bill=b.bill
+               WHERE b.session=? AND t.bill IS NULL ORDER BY b.first_seen DESC, b.bill_type, b.bill_num LIMIT ?""",
+            (session, limit)).fetchall()
+    done = 0
+    for i, r in enumerate(rows, 1):
+        if progress:
+            progress(i, len(rows), ok.display_bill(r["bill"]))
+        try:
+            get_text(session, r["bill"])
+            done += 1
+        except RuntimeError:
+            continue
+    match_session(session)
+    meta_set(f"texts:{session}", {"at": now_iso(), "fetched": done})
+    return {"fetched": done}
+
+
+def texts_missing(session: str) -> int:
+    with db() as c:
+        return c.execute("""SELECT COUNT(*) n FROM bills b LEFT JOIN texts t ON t.session=b.session AND t.bill=b.bill
+                            WHERE b.session=? AND t.bill IS NULL""", (session,)).fetchone()["n"]
 
 
 def rematch_all_sessions() -> None:
@@ -236,21 +328,23 @@ def session_name(code: str) -> str:
     return f"{ok.session_year(code)} session"
 
 
-def send_alerts() -> dict:
-    """Email each newly matched bill (one email per bill). Returns a summary."""
+def send_alerts(only: tuple[str, str] | None = None) -> dict:
+    """Email each newly matched bill (one email per bill). `only` limits it to one (session, bill)."""
     st = settings()
+    extra, args = ("AND m.session=? AND m.bill=?", list(only)) if only else ("", [])
     with db() as c:
         rows = c.execute(
-            """SELECT m.session, m.bill, m.priority_id, m.keywords, b.title, b.last_action, b.author, s.summary
+            f"""SELECT m.session, m.bill, m.priority_id, m.keywords, b.title, b.last_action, b.author, s.summary
                FROM matches m JOIN bills b ON b.session=m.session AND b.bill=m.bill
                LEFT JOIN summaries s ON s.session=m.session AND s.bill=m.bill
-               WHERE m.alert='pending' ORDER BY m.session, b.bill_type, b.bill_num"""
+               WHERE m.alert='pending' {extra} ORDER BY m.session, b.bill_type, b.bill_num""", args
         ).fetchall()
     if not rows:
         return {"sent": 0}
     if not st["alerts_enabled"]:
         with db() as c:
-            c.execute("UPDATE matches SET alert='skipped' WHERE alert='pending'")
+            for r in rows:
+                c.execute("UPDATE matches SET alert='skipped' WHERE alert='pending' AND session=? AND bill=?", (r["session"], r["bill"]))
         return {"sent": 0, "skipped": len(rows)}
 
     pri = {p["id"]: p for p in get_priorities()}
@@ -416,10 +510,7 @@ def summarize_bill(session: str, bill: str, force: bool = False) -> dict:
     have = get_summary(session, bill)
     if have and have.get("summary") and have.get("source_url") == url and not force:
         return have
-    try:
-        text = sm.bill_text(url) if url else ""
-    except Exception:  # noqa: BLE001 - fall back to the title when the PDF can't be read
-        text = ""
+    version, url, text = get_text(session, bill, detail=detail)
     try:
         summary, truncated = sm.summarize(ok.display_bill(bill), detail.get("title", ""), version, text)
     except sm.SummaryUnavailable as e:
@@ -484,8 +575,9 @@ def probe_filings(session: str, progress=None) -> list[str]:
     types = list(FILING_TYPES.items())
     for ti, (btype, start) in enumerate(types, 1):
         n = max(top.get(btype) or 0, start - 1) + 1
+        limit = FILING_MISSES if top.get(btype) else FILING_MISSES_START
         misses = 0
-        while misses < FILING_MISSES:
+        while misses < limit:
             if progress:
                 progress(ti, len(types), f"{btype} {n}")
             bill = f"{btype}{n}"
@@ -495,6 +587,7 @@ def probe_filings(session: str, progress=None) -> list[str]:
                 break
             if d.found:
                 store_detail(d)
+                get_text(session, bill, detail=d.to_dict())  # read the full text right away
                 found.append(bill)
                 misses = 0
             else:
@@ -504,13 +597,27 @@ def probe_filings(session: str, progress=None) -> list[str]:
 
 
 def check_filings(session: str, progress=None) -> dict:
+    """Find new filings, read their full text, match them, and email each match
+    as soon as it's ready (summary first, when AI summaries are on)."""
     new = probe_filings(session, progress)
-    created = match_session(session)
+    created = match_session(session, fetch_text=True)
     with db() as c:
-        alert_bills = [r["bill"] for r in c.execute(
-            "SELECT DISTINCT bill FROM matches WHERE session=? AND alert='pending'", (session,))]
-    summarize_pending(session, progress, bills=alert_bills)  # so the alert email can include summaries
-    result = {"new_bills": len(new), "new_matches": created, **send_alerts()}
+        pending = [r["bill"] for r in c.execute(
+            """SELECT DISTINCT m.bill FROM matches m JOIN bills b ON b.session=m.session AND b.bill=m.bill
+               WHERE m.session=? AND m.alert='pending' ORDER BY b.first_seen, b.bill_type, b.bill_num""", (session,))]
+    sent, error = 0, None
+    for i, bill in enumerate(pending, 1):
+        if progress:
+            progress(i, len(pending), f"alert for {ok.display_bill(bill)}")
+        summarize_pending(session, bills=[bill])  # quick; skipped when no API key
+        r = send_alerts(only=(session, bill))
+        sent += r.get("sent", 0)
+        if r.get("error"):
+            error = r["error"]
+            break
+    result = {"new_bills": len(new), "new_matches": created, "sent": sent}
+    if error:
+        result["error"] = error
     meta_set(f"filings:{session}", {"at": now_iso(), **result})
     return result
 
@@ -568,6 +675,8 @@ def scheduler() -> None:
                     start_job("index", DEFAULT_SESSION, lambda p: build_index(DEFAULT_SESSION, p))
                 elif sm.available() and _due(f"summaries:{DEFAULT_SESSION}", 0.25) and summary_candidates(DEFAULT_SESSION, 1):
                     start_job("summaries", DEFAULT_SESSION, lambda p: summarize_pending(DEFAULT_SESSION, p))
+                elif _due(f"texts:{DEFAULT_SESSION}", 0.1) and texts_missing(DEFAULT_SESSION):
+                    start_job("texts", DEFAULT_SESSION, lambda p: fetch_texts(DEFAULT_SESSION, p))
         except Exception:  # noqa: BLE001 - keep the scheduler alive
             pass
 
@@ -807,6 +916,8 @@ def api_status():
         job=dict(job),
         last_auto_refresh=meta_get("last_auto_refresh"),
         summaries=meta_get(f"summaries:{s}"),
+        texts_missing=texts_missing(s),
+        filings_minutes=FILINGS_MINUTES,
         summary_error=meta_get("summary_error"),
         summaries_waiting=len(summary_candidates(s, 1000)) if sm.available() else None,
     )
@@ -1116,7 +1227,8 @@ def api_agenda_preview():
     with db() as c:
         for r in c.execute("SELECT bill, title, subjects FROM bills WHERE session=? ORDER BY bill_type, bill_num", (s,)):
             got = ov.match_bill(r["title"] or "", json.loads(r["subjects"] or "[]"),
-                                [{"id": "draft", "keywords": kws, "exclude": exc}])
+                                [{"id": "draft", "keywords": kws, "exclude": exc}],
+                                get_text(s, r["bill"], fetch=False)[2])
             if got:
                 total += 1
                 if len(sample) < 8:
@@ -1139,6 +1251,7 @@ def api_settings():
         last_alert_error=meta_get("last_alert_error"),
         alert_sessions=[{"code": s, "name": session_name(s)} for s in ALERT_SESSIONS],
         filings_hours=FILINGS_HOURS,
+        filings_minutes=FILINGS_MINUTES,
     )
 
 

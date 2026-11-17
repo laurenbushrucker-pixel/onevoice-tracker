@@ -233,7 +233,7 @@ async function pollStatus() {
   const bar = $("#statusbar");
   if (job.running) {
     const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
-    const what = { index: "Building search index", filings: "Looking for newly filed bills", refresh: "Checking tracked bills", summaries: "Writing AI summaries" }[job.kind] || "Working";
+    const what = { index: "Building search index", filings: "Looking for newly filed bills", refresh: "Checking tracked bills", summaries: "Writing AI summaries", texts: "Reading bill texts" }[job.kind] || "Working";
     bar.innerHTML = `${what}: ${esc(job.label || "starting")} (${job.done}/${job.total || "?"})<span class="bar"><i style="width:${pct}%"></i></span>`;
   } else {
     const parts = [];
@@ -255,6 +255,7 @@ async function pollStatus() {
       await Promise.all([loadTracked(), loadUpdates(), loadSubjects(), loadAgenda(), loadSettings()]);
       if (currentView() === "find") runSearch(true);
       let msg = { index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
+        texts: "Bill texts updated",
         summaries: job.result ? `Wrote ${job.result.summarized} AI summar${job.result.summarized === 1 ? "y" : "ies"}` : "AI summaries updated" }[job.kind];
       if (job.kind === "filings" && job.result) {
         const r = job.result;
@@ -373,10 +374,10 @@ async function loadSettings() {
   if (document.activeElement !== $("#s-url")) $("#s-url").value = s.app_url || "";
   const sessions = s.alert_sessions.map((x) => x.name).join(", ");
   $("#alerts-explainer").textContent =
-    (s.filings_hours > 0
-      ? `Every ${s.filings_hours === 1 ? "hour" : s.filings_hours + " hours"} the tracker looks for bills newly filed in the ${sessions} and checks their titles against the agenda keywords. `
+    (s.filings_minutes > 0
+      ? `Every ${s.filings_minutes < 60 ? s.filings_minutes + " minutes" : (s.filings_minutes === 60 ? "hour" : s.filings_minutes / 60 + " hours")} the tracker looks for bills newly filed in the ${sessions}, reads each one's full text, and checks it against the agenda keywords. `
       : `Automatic checks are turned off on this server; use Check for new filings on the Agenda page to look for bills newly filed in the ${sessions}. `) +
-    `When any match, it sends one email listing them. Bills that were already filed when the tracker started, or that only match after you edit keywords, are not emailed.`;
+`Each matching bill gets its own email as soon as it's found. Bills that were already filed when the tracker started, or that only match after you edit keywords, are not emailed.`;
   const st = $("#email-status");
   if (s.email_configured) {
     st.className = "email-status ok";
