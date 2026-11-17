@@ -1691,7 +1691,9 @@ button{font:inherit;font-weight:600;border:0;border-radius:6px;padding:10px 16px
 // open links in advance can't mark bills by accident.
 fetch(location.pathname, {method: "POST"}).then(r => r.json()).then(d => {
   document.getElementById("card").innerHTML = d.ok
-    ? '<p class="big ' + (d.verdict === "relevant" ? 'yes">✓ Marked relevant' : 'no">✕ Marked not relevant') + '</p><p>%BILL% · %PRIORITY%</p><p style="margin-top:10px">You can close this tab. Clicked the wrong one? Use the other button in the email.</p>'
+    ? (d.test
+        ? '<p class="big yes">✓ The button works</p><p>This was the test email, so no bill was marked. In a real alert, this click marks the bill ' + (d.verdict === "relevant" ? "Relevant" : "Not relevant") + '.</p><p style="margin-top:10px">You can close this tab.</p>'
+        : '<p class="big ' + (d.verdict === "relevant" ? 'yes">✓ Marked relevant' : 'no">✕ Marked not relevant') + '</p><p>%BILL% · %PRIORITY%</p><p style="margin-top:10px">You can close this tab. Clicked the wrong one? Use the other button in the email.</p>')
     : '<p class="big">This link has expired</p><p>Open OneVoice Tracker to mark this bill.</p>';
 }).catch(() => { document.getElementById("card").innerHTML = '<p class="big">Couldn’t save</p><p>Check your connection and click the link again.</p>'; });
 </script></body></html>"""
@@ -1727,6 +1729,8 @@ def review_link_save(token):
     if not t:
         return jsonify(ok=False), 404
     session, bill, pid, verdict = t
+    if session == "TEST":  # buttons in the test email: prove the link works, mark nothing
+        return jsonify(ok=True, verdict=verdict, test=True)
     with db() as c:
         m = c.execute("SELECT keywords FROM matches WHERE session=? AND bill=? AND priority_id=?", (session, bill, pid)).fetchone()
         c.execute("INSERT OR REPLACE INTO reviews(session,bill,priority_id,verdict,keywords,at) VALUES(?,?,?,?,?,?)",
@@ -1842,7 +1846,7 @@ def api_test_email():
         "url": ok.BASE, "last_action": "",
         "priorities": [{"task_force": "Workforce and Talent Strategies", "number": 1,
                         "title": "Strengthen Public Education and Early Literacy", "keywords": ["schools (title)"],
-                        "review_links": {"relevant": (st["app_url"] or "").rstrip("/") + "/r/example", "not_relevant": (st["app_url"] or "").rstrip("/") + "/r/example"} if st["app_url"] else {}}],
+                        "review_links": review_links(st["app_url"], "TEST", "HB0", "wts-1")}],
     }
     subject, text, html_body = ov.render_alert(sample, st["app_url"], session_name(DEFAULT_SESSION))
     try:
