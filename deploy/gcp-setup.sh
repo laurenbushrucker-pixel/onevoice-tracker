@@ -24,12 +24,16 @@ fi
 
 # ------------------------------------------------------------------ packages
 say "Installing system packages (a few minutes on a small server)"
-if ! swapon --show | grep -q /swapfile; then
-  # The free server has 1 GB of memory; a swap file keeps installs from failing.
-  sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile
-  sudo mkswap /swapfile >/dev/null && sudo swapon /swapfile
-  echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
+# The free server has 1 GB of memory; a swap file keeps installs from failing.
+# (swapon lives in /sbin, which isn't on a normal user's PATH, so read /proc/swaps.)
+if ! grep -q '^/swapfile ' /proc/swaps; then
+  if [ ! -f /swapfile ]; then
+    sudo fallocate -l 1G /swapfile && sudo chmod 600 /swapfile
+    sudo /sbin/mkswap /swapfile >/dev/null
+  fi
+  sudo /sbin/swapon /swapfile
 fi
+grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab >/dev/null
 sudo apt-get update -qq
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv git curl gnupg \
   debian-keyring debian-archive-keyring apt-transport-https >/dev/null
