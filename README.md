@@ -46,6 +46,26 @@ Each summary is labeled with its source on the website and in alert emails.
 gives an AI summary on filing day. This costs roughly 2–4 cents per bill. If
 the API call fails, the tracker falls back to the free summary.
 
+## New bills list and keyword search
+
+The **New bills** tab is a running list of every bill that matches the agenda,
+newest first, with everything the alert emails show: bill number, author,
+subject areas (with Relevant / Not relevant buttons), summary, a link to the
+bill text PDF and the oklegislature.gov page, and current status with the
+progress bar.
+
+- **Chamber position**: choose Support, Oppose, Monitor or Neutral on any bill,
+  with an optional "Why". Choosing a position adds the bill to My bills, so
+  you're emailed when it moves; the position and reason appear in those
+  emails and in the CSV export.
+- **Keyword search**: the search box on New bills (agenda bills) and on Find
+  bills (every bill in the session) searches titles, summaries and the full
+  bill text. Words match their beginnings (`tax` finds "taxation"); put an
+  exact phrase in quotes ("advanced air mobility"). Each result shows the
+  passage where the words appear.
+- Filter by agenda priority, relevance (not reviewed, relevant, not relevant)
+  and position (including "No position yet").
+
 ## Staying reliable
 
 - **Daily check-in** (7 a.m. Central, `BILLTRACKER_CHECKIN_HOUR`): an email

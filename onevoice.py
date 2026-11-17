@@ -307,7 +307,8 @@ def render_movement(item: dict, app_url: str) -> tuple[str, str, str]:
     for a in acts:
         lines.append(f"{a['date']}  {chamber.get(a['chamber'], a['chamber'])}: {a['action']}")
     lines += ["", f"Bill number: {item['display']}", f"Author: {item.get('author') or 'Not listed'}",
-              f"Your position: {item.get('position', '').capitalize()}", f"Status: {item.get('stage_label', '')}"]
+              f"Chamber position: {item.get('position', '').capitalize()}" + (f" (why: {item['reason']})" if item.get("reason") else ""),
+              f"Status: {item.get('stage_label', '')}"]
     if item.get("summary"):
         lines += ["", f"What it does: {item['summary']}"]
     if item.get("progress"):
@@ -327,8 +328,9 @@ def render_movement(item: dict, app_url: str) -> tuple[str, str, str]:
         f'<p style="color:#4d574a;margin:0 0 12px;font-size:14px">{e(item.get("title", ""))}</p>'
         f'<table role="presentation" width="100%" style="border-collapse:collapse;border-top:1px solid #e3e7df;border-bottom:1px solid #e3e7df">{rows}</table>'
         f'<p style="font-size:14px;color:#1d241b;margin:14px 0 4px"><b>Author:</b> {e(item.get("author") or "Not listed")} &nbsp; '
-        f'<b>Your position:</b> <span style="color:{pos_color};font-weight:700">{e(pos.capitalize())}</span> &nbsp; '
+        f'<b>Chamber position:</b> <span style="color:{pos_color};font-weight:700">{e(pos.capitalize())}</span> &nbsp; '
         f'<b>Status:</b> {e(item.get("stage_label", ""))}</p>'
+        + (f'<p style="font-size:14px;color:#3d4a3a;margin:4px 0 0"><b>Why:</b> {e(item["reason"])}</p>' if item.get("reason") else "")
         + (f'<p style="font-size:14px;color:#3d4a3a;margin:8px 0 16px"><b>What it does:</b> {e(item["summary"])}</p>' if item.get("summary") else "")
         + progress_html(item.get("progress")) + '<div style="height:14px"></div>'
         + f'<div>{_button(app_url + "#mine" if app_url else "", "Open OneVoice Tracker")}{_button(item["url"], "Read the bill", False)}</div>'

@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import base64
+import re
 import hmac
 import secrets
 import zlib
@@ -45,6 +46,7 @@ CENTRAL = ZoneInfo("America/Chicago")
 CHECKIN_HOUR = int(os.environ.get("BILLTRACKER_CHECKIN_HOUR", "7"))  # daily check-in email, Central time
 BACKUPS_KEPT = 14
 STARTED_AT = datetime.now(timezone.utc)
+FTS_TABLE = True  # set False at startup when SQLite lacks FTS5
 INDEX_HOURS = float(os.environ.get("BILLTRACKER_INDEX_HOURS", "6"))  # full index rebuild, the safety net; 0 = off
 # How often to look for newly filed bills. Speed is the point, so the default is every 10 minutes.
 FILINGS_MINUTES = float(os.environ.get("BILLTRACKER_FILINGS_MINUTES",
@@ -154,6 +156,12 @@ def init_db() -> None:
         for col in ("first_seen", "matched_at", "author"):
             if col not in cols:  # upgrade a database made by an earlier version
                 c.execute(f"ALTER TABLE bills ADD COLUMN {col} TEXT")
+        if "reason" not in {r["name"] for r in c.execute("PRAGMA table_info(tracked)")}:
+            c.execute("ALTER TABLE tracked ADD COLUMN reason TEXT DEFAULT ''")
+        try:
+            c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS bill_fts USING fts5(session UNINDEXED, bill UNINDEXED, title, summary, body)")
+        except sqlite3.OperationalError:
+            pass  # SQLite without FTS5: keyword search falls back to titles
         ucols = {r["name"] for r in c.execute("PRAGMA table_info(updates)")}
         if "emailed" not in ucols:
             c.execute("ALTER TABLE updates ADD COLUMN emailed INTEGER DEFAULT 0")
@@ -164,6 +172,49 @@ def init_db() -> None:
             c.execute("ALTER TABLE summaries ADD COLUMN checked_at TEXT")
         if not c.execute("SELECT 1 FROM priorities LIMIT 1").fetchone():
             seed_priorities(c)
+    if FTS_OK() and not meta_get("fts_built"):
+        rebuild_fts()
+        meta_set("fts_built", now_iso())
+
+
+def FTS_OK() -> bool:  # noqa: N802
+    with db() as c:
+        return bool(c.execute("SELECT 1 FROM sqlite_master WHERE name='bill_fts'").fetchone())
+
+
+def fts_update(c: sqlite3.Connection, session: str, bill: str) -> None:
+    """Refresh one bill in the keyword-search index (title, summary, full text)."""
+    try:
+        b = c.execute("SELECT title FROM bills WHERE session=? AND bill=?", (session, bill)).fetchone()
+        sm_row = c.execute("SELECT summary FROM summaries WHERE session=? AND bill=?", (session, bill)).fetchone()
+        t = c.execute("SELECT body FROM texts WHERE session=? AND bill=?", (session, bill)).fetchone()
+        body = zlib.decompress(t["body"]).decode("utf-8") if t and t["body"] else ""
+        c.execute("DELETE FROM bill_fts WHERE session=? AND bill=?", (session, bill))
+        c.execute("INSERT INTO bill_fts(session,bill,title,summary,body) VALUES(?,?,?,?,?)",
+                  (session, bill, (b["title"] if b else "") or "", (sm_row["summary"] if sm_row else "") or "", body))
+    except sqlite3.OperationalError:
+        pass
+
+
+def rebuild_fts() -> None:
+    with db() as c:
+        bills = c.execute("SELECT session, bill FROM bills").fetchall()
+        for r in bills:
+            fts_update(c, r["session"], r["bill"])
+
+
+def fts_query(text: str) -> str:
+    """User words -> FTS5 query: every word must appear (as a word start); "quoted phrases" stay together."""
+    parts = re.findall(r'"([^"]+)"|(\S+)', text)
+    terms = []
+    for phrase, word in parts:
+        if phrase:
+            terms.append('"' + phrase.replace('"', "") + '"')
+        else:
+            w = re.sub(r"[^\w'-]", "", word)
+            if w:
+                terms.append('"' + w.replace('"', "") + '"*')
+    return " AND ".join(terms)
 
 
 def seed_priorities(c: sqlite3.Connection) -> None:
@@ -289,6 +340,7 @@ def store_text(session: str, bill: str, version: str, url: str, text: str, error
         )
         if not prev or prev["source_url"] != url:
             c.execute("UPDATE bills SET matched_at=NULL WHERE session=? AND bill=?", (session, bill))  # re-match on new text
+        fts_update(c, session, bill)
 
 
 def get_text(session: str, bill: str, fetch: bool = True, detail: dict | None = None) -> tuple[str, str, str]:
@@ -433,6 +485,8 @@ def upsert_index(session: str, entries: dict[str, ok.IndexEntry]) -> None:
                      stage=CASE WHEN bills.last_action_date IS NULL THEN excluded.stage ELSE bills.stage END""",
                 (session, e.bill, t, n, e.title, e.last_action, stage, json.dumps(e.subjects), ts, ts),
             )
+            if FTS_TABLE:
+                fts_update(c, session, e.bill)
 
 
 def store_detail(d: ok.BillDetail) -> list[ok.Action]:
@@ -458,6 +512,8 @@ def store_detail(d: ok.BillDetail) -> list[ok.Action]:
             (d.session, d.bill, t, n, d.title, last.action if last else "", last.date if last else None, stage, now_iso(),
              author_text(d.author, d.other_author)),
         )
+        if FTS_TABLE:
+            fts_update(c, d.session, d.bill)
     if not prev:
         return []
     old = {(a["action"], a["date"], a["chamber"]) for a in json.loads(prev["data"]).get("actions", [])}
@@ -536,7 +592,7 @@ def send_movement_emails() -> dict:
     with db() as c:
         rows = c.execute(
             """SELECT u.id, u.session, u.bill, u.action, u.date, u.chamber, u.category, u.detected_at,
-                      t.position, b.title, b.author, b.stage, s.summary
+                      t.position, t.reason, b.title, b.author, b.stage, s.summary
                FROM updates u JOIN tracked t ON t.session=u.session AND t.bill=u.bill
                LEFT JOIN bills b ON b.session=u.session AND b.bill=u.bill
                LEFT JOIN summaries s ON s.session=u.session AND s.bill=u.bill
@@ -561,7 +617,7 @@ def send_movement_emails() -> dict:
         r0 = items[0][0]
         item = {
             "display": ok.display_bill(bill), "author": r0["author"] or "", "title": r0["title"] or "",
-            "summary": r0["summary"] or "", "url": ok.bill_url(bill, session), "position": r0["position"] or "",
+            "summary": r0["summary"] or "", "url": ok.bill_url(bill, session), "position": r0["position"] or "", "reason": r0["reason"] or "",
             "stage_label": ok.STAGE_LABEL.get(r0["stage"] or "unknown", ""),
             "actions": [{"date": r["date"], "chamber": r["chamber"], "action": r["action"], "category_label": CATEGORY_LABEL.get(cat, "")}
                         for r, cat in items],
@@ -656,6 +712,7 @@ def _save_summary(session, bill, summary, version, url, model, truncated) -> Non
                VALUES(?,?,?,?,?,?,?,?,?,NULL)""",
             (session, bill, summary, version, url, model, int(truncated), now_iso(), now_iso()),
         )
+        fts_update(c, session, bill)
 
 
 def summary_candidates(session: str, limit: int) -> list[str]:
@@ -1380,6 +1437,9 @@ def api_search():
     if bill:
         where.append("b.bill=?")
         args.append(bill)
+    elif q and FTS_TABLE and fts_query(q):
+        where.append("b.bill IN (SELECT bill FROM bill_fts WHERE session=? AND bill_fts MATCH ?)")
+        args += [s, fts_query(q)]
     elif q:
         for word in q.split():
             where.append("(b.title LIKE ? OR b.bill LIKE ?)")
@@ -1430,7 +1490,32 @@ def api_search():
                     (s, bill),
                 ).fetchall()
             total = len(rows)
-    return jsonify(total=total, results=with_agenda(s, [bill_row(r) for r in rows]))
+    results = with_agenda(s, [bill_row(r) for r in rows])
+    if q and not bill:
+        add_snippets(s, q, results)
+    return jsonify(total=total, results=results)
+
+
+def add_snippets(session: str, q: str, rows: list[dict]) -> None:
+    """Show where the search words appear in each bill."""
+    if not FTS_TABLE or not rows or not fts_query(q):
+        return
+    with db() as c:
+        try:
+            found = {}
+            for r in c.execute(
+                f"""SELECT bill, snippet(bill_fts, 4, '[[', ']]', '…', 14) AS body,
+                           snippet(bill_fts, 3, '[[', ']]', '…', 14) AS summary,
+                           snippet(bill_fts, 2, '[[', ']]', '…', 14) AS title FROM bill_fts
+                    WHERE session=? AND bill_fts MATCH ? AND bill IN ({','.join('?' * len(rows))})""",
+                    [session, fts_query(q)] + [r["bill"] for r in rows]):
+                # Prefer the bill text, then the summary, then the title: whichever actually contains the words.
+                found[r["bill"]] = next((x for x in (r["body"], r["summary"], r["title"]) if x and "[[" in x), r["title"])
+        except sqlite3.OperationalError:
+            return
+    for r in rows:
+        if r["bill"] in found:
+            r["snippet"] = re.sub(r"\s+", " ", found[r["bill"]]).strip()
 
 
 TRACKED_SQL = """SELECT t.*, b.title, b.last_action, b.last_action_date, b.stage, b.subjects,
@@ -1463,9 +1548,12 @@ def api_track():
     match_session(s)
     with db() as c:
         c.execute(
-            "INSERT OR IGNORE INTO tracked(session,bill,position,priority,added_at,last_checked) VALUES(?,?,?,?,?,?)",
-            (s, bill, body.get("position") or "monitor", body.get("priority") or "medium", now_iso(), now_iso()),
+            "INSERT OR IGNORE INTO tracked(session,bill,position,priority,reason,added_at,last_checked) VALUES(?,?,?,?,?,?,?)",
+            (s, bill, body.get("position") if body.get("position") in POSITIONS else "monitor",
+             body.get("priority") or "medium", str(body.get("reason") or "")[:1000], now_iso(), now_iso()),
         )
+        if body.get("position") in POSITIONS:  # choosing a position on an already-tracked bill
+            c.execute("UPDATE tracked SET position=? WHERE session=? AND bill=?", (body["position"], s, bill))
         row = c.execute(TRACKED_SQL + " WHERE t.session=? AND t.bill=?", (s, bill)).fetchone()
     return jsonify(with_agenda(s, [bill_row(row)])[0])
 
@@ -1482,6 +1570,8 @@ def api_update_tracked(session, bill):
         fields.append("notes=?"); args.append(str(body["notes"])[:20000])
     if "labels" in body:
         fields.append("labels=?"); args.append(str(body["labels"])[:500])
+    if "reason" in body:
+        fields.append("reason=?"); args.append(str(body["reason"])[:1000])
     if not fields:
         abort(400, "Nothing to update.")
     with db() as c:
@@ -1574,6 +1664,61 @@ def api_updates_seen():
         else:
             c.execute("UPDATE updates SET seen=1 WHERE session=?", (s,))
     return jsonify(ok=True)
+
+
+# ------------------------------------------------------------ new bills list
+
+
+@app.get("/api/newbills")
+def api_newbills():
+    """Every bill that matches the agenda, newest first, with what the alert
+    emails show: author, subject areas, summary, bill text link, status, and
+    the Chamber's position."""
+    s = want_session()
+    q = (request.args.get("q") or "").strip()
+    pid = request.args.get("priority") or ""
+    review = request.args.get("review") or ""      # "" = to review + relevant, todo, relevant, not_relevant, all
+    position = request.args.get("position") or ""  # "" any, none, support, oppose, monitor, neutral
+    limit = min(int(request.args.get("limit", 30)), 100)
+    offset = max(int(request.args.get("offset", 0)), 0)
+
+    m_where, m_args = ["m.session=b.session", "m.bill=b.bill"], []
+    if pid:
+        m_where.append("m.priority_id=?"); m_args.append(pid)
+    rv = {"todo": "rv.verdict IS NULL", "relevant": "rv.verdict='relevant'", "not_relevant": "rv.verdict='not_relevant'",
+          "all": "1=1"}.get(review, "COALESCE(rv.verdict,'')!='not_relevant'")
+    m_where.append(rv)
+    where = [f"""EXISTS (SELECT 1 FROM matches m LEFT JOIN reviews rv ON rv.session=m.session AND rv.bill=m.bill
+                          AND rv.priority_id=m.priority_id WHERE {' AND '.join(m_where)})""", "b.session=?"]
+    args = m_args + [s]
+    bill = ok.normalize_bill(q) if q else None
+    if bill:
+        where.append("b.bill=?"); args.append(bill)
+    elif q and FTS_TABLE and fts_query(q):
+        where.append("b.bill IN (SELECT bill FROM bill_fts WHERE session=? AND bill_fts MATCH ?)"); args += [s, fts_query(q)]
+    elif q:
+        where.append("b.title LIKE ?"); args.append(f"%{q}%")
+    if position == "none":
+        where.append("t.bill IS NULL")
+    elif position in POSITIONS:
+        where.append("t.position=?"); args.append(position)
+    sql_where = " AND ".join(where)
+    base = f"""FROM bills b LEFT JOIN tracked t ON t.session=b.session AND t.bill=b.bill
+               LEFT JOIN summaries su ON su.session=b.session AND su.bill=b.bill
+               LEFT JOIN texts tx ON tx.session=b.session AND tx.bill=b.bill WHERE {sql_where}"""
+    with db() as c:
+        total = c.execute(f"SELECT COUNT(*) n {base}", args).fetchone()["n"]
+        rows = c.execute(
+            f"""SELECT b.*, t.position AS tracked_position, t.reason AS position_reason, su.summary, su.model AS summary_model,
+                       tx.source_url AS text_url, tx.version AS text_version,
+                       (SELECT MAX(alerted_at) FROM matches m2 WHERE m2.session=b.session AND m2.bill=b.bill AND m2.alert='sent') AS emailed_at
+                {base} ORDER BY b.first_seen DESC, b.bill_type, b.bill_num LIMIT ? OFFSET ?""", args + [limit, offset]).fetchall()
+    out = with_agenda(s, [bill_row(r) for r in rows])
+    for r in out:
+        r["progress"] = bill_progress(s, r["bill"])
+    if q and not bill:
+        add_snippets(s, q, out)
+    return jsonify(total=total, results=out)
 
 
 # ---------------------------------------------------------------- agenda API
@@ -1865,12 +2010,12 @@ def api_export():
     rows = with_agenda(s, [bill_row(r) for r in rows])
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Bill", "Author", "AI summary", "Title", "OneVoice priorities", "Status", "Last action", "Last action date", "Position",
+    w.writerow(["Bill", "Author", "Summary", "Title", "OneVoice priorities", "Status", "Last action", "Last action date", "Position", "Why",
                 "Priority", "Labels", "Notes", "Link"])
     for d in rows:
         tags = "; ".join(f"{pri[a['id']]['task_force']} #{pri[a['id']]['number']}" for a in d["agenda"] if a["id"] in pri)
         w.writerow([d["display"], d.get("author") or "", d.get("summary") or "", d["title"], tags, d["stage_label"], d["last_action"], d["last_action_date"] or "",
-                    d["position"], d["priority"], d["labels"], d["notes"], d["url"]])
+                    d["position"], d.get("reason") or "", d["priority"], d["labels"], d["notes"], d["url"]])
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename=onevoice-tracked-bills-{s}.csv"})
 
@@ -1879,7 +2024,9 @@ def api_export():
 
 
 def main(argv: list[str]) -> None:
+    global FTS_TABLE
     init_db()
+    FTS_TABLE = FTS_OK()
     app.secret_key = _secret_key()
     cmd = argv[1] if len(argv) > 1 else "serve"
     say = lambda i, t, label: print(f"[{i}/{t}] {label}", flush=True)  # noqa: E731

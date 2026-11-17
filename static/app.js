@@ -10,10 +10,11 @@ const state = {
   agenda: [],
   stageFilter: "",
   find: { offset: 0, total: 0, results: [] },
+  nb: { offset: 0, total: 0, results: [] },
   drawer: null, // { session, bill, data }
   editing: null, // priority id whose keywords are open
 };
-const VIEWS = ["agenda", "mine", "find", "updates", "settings"];
+const VIEWS = ["agenda", "newbills", "mine", "find", "updates", "settings"];
 const STAGE_ORDER = ["introduced", "committee", "floor", "crossed", "passed", "governor", "law"];
 const PROGRESS_LABELS = ["Filed", "Committee", "Floor", "2nd chamber", "Passed", "Governor", "Enacted"];
 const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
@@ -121,6 +122,59 @@ function agendaTags(list) {
   }).join("")}</div>`;
 }
 
+function snippetHtml(sn) {
+  if (!sn) return "";
+  return `<p class="snippet">Found: ${esc(sn).replace(/\[\[/g, "<mark>").replace(/\]\]/g, "</mark>")}</p>`;
+}
+function positionPicker(r) {
+  const pos = r.tracked_position || "";
+  return `<div class="pos-pick" data-bill="${esc(r.bill)}">
+    <label>Chamber position
+      <select class="pos-select${pos ? " pos-" + esc(pos) : ""}" aria-label="Chamber position on ${esc(r.display)}">
+        <option value="" ${pos ? "" : "selected"}>Choose a position…</option>
+        ${["support", "oppose", "monitor", "neutral"].map((p) => `<option value="${p}" ${p === pos ? "selected" : ""}>${cap(p)}</option>`).join("")}
+      </select></label>
+    <label class="pos-why-label">Why <input class="pos-why" maxlength="1000" placeholder="Optional: the reason, for the record" value="${esc(r.position_reason || "")}" ${pos ? "" : "disabled"}></label>
+  </div>`;
+}
+function bindPositions(root, list) {
+  root.querySelectorAll(".pos-pick").forEach((box) => {
+    const bill = box.dataset.bill, sel = box.querySelector(".pos-select"), why = box.querySelector(".pos-why");
+    sel.addEventListener("change", async () => {
+      if (!sel.value) return;
+      try {
+        const row = state.tracked.find((t) => t.bill === bill)
+          ? await api(`/api/tracked/${state.session}/${bill}`, { method: "PATCH", body: { position: sel.value } })
+          : await api("/api/tracked", { method: "POST", body: { session: state.session, bill, position: sel.value } });
+        sel.className = "pos-select pos-" + sel.value;
+        why.disabled = false;
+        list.forEach((r) => { if (r.bill === bill) r.tracked_position = sel.value; });
+        toast(`${row.display}: Chamber position set to ${cap(sel.value)}. It’s on My bills, and you’ll get an email when it moves.`);
+        loadTracked();
+      } catch (err) { toast(err.message, true); }
+    });
+    let saved = why.value;
+    const saveWhy = async () => {
+      if (why.value === saved || why.disabled) return;
+      try {
+        await api(`/api/tracked/${state.session}/${bill}`, { method: "PATCH", body: { reason: why.value } });
+        saved = why.value;
+        list.forEach((r) => { if (r.bill === bill) r.position_reason = why.value; });
+        toast("Reason saved");
+      } catch (err) { toast(err.message, true); }
+    };
+    why.addEventListener("blur", saveWhy);
+    why.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); why.blur(); } });
+  });
+}
+function miniProgress(pr, r) {
+  if (!pr) return `<p class="last"><b>Status:</b> ${esc(r.stage_label || "")}${r.last_action ? ` · ${esc(r.last_action)}` : ""}</p>`;
+  return `<div class="mini-prog"><span class="prog-pct st-${esc(pr.status)}">${pr.percent}%</span>
+    <div class="prog-bar st-${esc(pr.status)}">${pr.steps.map((st) => `<i class="${st.done ? "on" : st.current ? "cur" : ""}" title="${esc(st.label)}"></i>`).join("")}</div>
+    <span class="mini-where">${esc(pr.where)}</span></div>
+    <p class="last"><b>Last action:</b> ${esc(r.last_action || "None yet")}${r.last_action_date ? " · " + fmtDate(r.last_action_date) : ""}</p>`;
+}
+
 function reviewButtons(bill, pid, verdict) {
   return `<span class="review" data-bill="${esc(bill)}" data-pid="${esc(pid)}">
     <button type="button" class="rv rv-yes" data-verdict="relevant" aria-pressed="${verdict === "relevant"}">✓ Relevant</button>
@@ -167,6 +221,7 @@ async function boot() {
 
 function fillAgendaSelects() {
   const opts = state.config.agenda.map((p) => `<option value="${p.id}">${esc(shortLabel(p))}: ${esc(p.title)}</option>`).join("");
+  $("#nb-priority").innerHTML = `<option value="">All agenda priorities</option>${opts}`;
   $("#find-agenda").innerHTML = `<option value="">All bills</option><option value="any">Matches any agenda item</option>${opts}`;
   $("#mine-agenda").innerHTML = `<option value="">Any agenda item</option><option value="any">Matches the agenda</option>${opts}`;
 }
@@ -177,7 +232,9 @@ function bindEvents() {
     state.session = e.target.value;
     try { localStorage.setItem("ovt.session", state.session); } catch { /* ignore */ }
     state.find = { offset: 0, total: 0, results: [] };
+    state.nb = { offset: 0, total: 0, results: [] };
     await loadSession();
+    if (currentView() === "newbills") runNewBills(true);
     if (currentView() === "find") runSearch(true);
   });
   $("#btn-refresh").addEventListener("click", () => startJob(`/api/refresh?session=${state.session}`, "Checking tracked bills on oklegislature.gov"));
@@ -195,6 +252,9 @@ function bindEvents() {
     window.location.href = `/api/export.csv?session=${state.session}`;
   });
   $("#find-form").addEventListener("submit", (e) => { e.preventDefault(); runSearch(true); });
+  $("#nb-form").addEventListener("submit", (e) => { e.preventDefault(); runNewBills(true); });
+  ["#nb-priority", "#nb-review", "#nb-position"].forEach((s) => $(s).addEventListener("change", () => runNewBills(true)));
+  $("#nb-more").addEventListener("click", () => runNewBills(false));
   ["#find-agenda", "#find-dismissed", "#find-subject", "#find-chamber", "#find-stage", "#find-sort"].forEach((s) => $(s).addEventListener("change", () => {
     if (location.hash.startsWith("#bills-")) history.replaceState(null, "", "#find");
     $("#find-back").hidden = true;
@@ -257,6 +317,7 @@ function route() {
   document.querySelectorAll(".view").forEach((v) => (v.hidden = v.id !== `view-${view}`));
   document.querySelectorAll(".tabs a").forEach((a) => a.setAttribute("aria-current", a.dataset.view === view ? "page" : "false"));
   if (view === "find" && !state.find.results.length) runSearch(true);
+  if (view === "newbills" && !state.nb.results.length) runNewBills(true);
 }
 
 // ------------------------------------------------------------------ status
@@ -292,6 +353,7 @@ async function pollStatus() {
     if (!firstSeen) {
       await Promise.all([loadTracked(), loadUpdates(), loadSubjects(), loadAgenda(), loadSettings()]);
       if (currentView() === "find") runSearch(true);
+      if (currentView() === "newbills") runNewBills(true);
       let msg = { index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
         texts: "Bill texts updated",
         summaries: job.result ? `Updated ${job.result.summarized} summar${job.result.summarized === 1 ? "y" : "ies"}` : "Summaries updated" }[job.kind];
@@ -568,7 +630,7 @@ function renderMine() {
         ${t.labels ? `<div class="labels">${t.labels.split(",").map((l) => l.trim()).filter(Boolean).map((l) => `<span class="tag">${esc(l)}</span>`).join("")}</div>` : ""}</td>
       <td class="last-action"><div>${esc(t.last_action || "")}</div><div class="date">${fmtDate(t.last_action_date)}</div></td>
       <td>${stagePill(t.stage, t.stage_label, closed)}</td>
-      <td class="cell-pos"><select data-field="position" class="pos-${esc(t.position)}" aria-label="Position on ${esc(t.display)}">${optionList(state.config.positions, t.position)}</select></td>
+      <td class="cell-pos"><select data-field="position" class="pos-${esc(t.position)}" aria-label="Position on ${esc(t.display)}">${optionList(state.config.positions, t.position)}</select>${t.reason ? `<div class="why-small" title="${esc(t.reason)}">${esc(t.reason)}</div>` : ""}</td>
       <td class="cell-pri"><select data-field="priority" aria-label="Priority for ${esc(t.display)}">${optionList(state.config.priorities, t.priority)}</select></td>
     </tr>`).join("");
   $("#mine-empty").hidden = state.tracked.length > 0;
@@ -602,6 +664,76 @@ async function saveTracking(bill, fields) {
     toast("Saved");
     return row;
   } catch (e) { toast(e.message, true); }
+}
+
+// ------------------------------------------------------------------ new bills
+async function runNewBills(reset) {
+  if (reset) state.nb = { offset: 0, total: 0, results: [] };
+  const p = new URLSearchParams({ session: state.session, q: $("#nb-q").value.trim(), priority: $("#nb-priority").value,
+    review: $("#nb-review").value, position: $("#nb-position").value, offset: state.nb.offset, limit: 30 });
+  $("#nb-meta").textContent = "Loading…";
+  try {
+    const data = await api(`/api/newbills?${p}`);
+    state.nb.total = data.total;
+    state.nb.results = state.nb.results.concat(data.results);
+    state.nb.offset = state.nb.results.length;
+    renderNewBills();
+  } catch (e) { $("#nb-meta").textContent = e.message; }
+}
+
+function renderNewBills() {
+  const { results, total } = state.nb;
+  const q = $("#nb-q").value.trim();
+  $("#nb-meta").textContent = results.length
+    ? `Showing ${results.length.toLocaleString()} of ${total.toLocaleString()} bills that match the agenda, newest first${q ? ` · containing “${q}”` : ""}`
+    : "";
+  $("#nb-empty").hidden = results.length > 0;
+  if (!results.length && q) { $("#nb-empty").hidden = true; $("#nb-meta").textContent = `No agenda bills contain “${q}”. Try Find bills to search every bill.`; }
+  const pid = $("#nb-priority").value;
+  $("#nb-list").innerHTML = results.map((r) => {
+    const ags = (r.agenda || []).filter((a) => !pid || a.id === pid);
+    return `
+    <li class="nb-card">
+      <div class="nb-head">
+        <a class="billno nb-open" href="#" data-bill="${esc(r.bill)}">${esc(r.display)}</a>
+        ${r.author ? `<span class="by">by ${esc(r.author)}</span>` : ""}
+        <span class="date">${r.first_seen ? "Found " + fmtDate(r.first_seen) : ""}</span>
+        ${r.emailed_at ? `<span class="badge-mail" title="Alert emailed ${esc(fmtDate(r.emailed_at))}">Emailed</span>` : ""}
+      </div>
+      <div class="nb-areas">${ags.map((a) => {
+        const p = priorityById(a.id);
+        return p ? `<div class="nb-area"><span><b>${esc(shortLabel(p))}</b> · ${esc(p.title)}</span>${reviewButtons(r.bill, a.id, a.review)}</div>` : "";
+      }).join("")}</div>
+      ${summaryCell(r)}
+      ${snippetHtml(r.snippet)}
+      ${miniProgress(r.progress, r)}
+      <div class="nb-foot">
+        ${positionPicker(r)}
+        <div class="nb-links">
+          ${r.text_url ? `<a href="${esc(r.text_url)}" target="_blank" rel="noopener">Bill text (PDF${r.text_version ? ", " + esc(r.text_version) : ""})</a>` : ""}
+          <a href="${esc(r.url)}" target="_blank" rel="noopener">oklegislature.gov page</a>
+          <a href="#" class="nb-open" data-bill="${esc(r.bill)}">Full details</a>
+        </div>
+      </div>
+      ${officialTitle(r)}
+    </li>`;
+  }).join("");
+  $("#nb-more").hidden = results.length >= total;
+  bindSummarize($("#nb-list"));
+  bindPositions($("#nb-list"), state.nb.results);
+  bindReviews($("#nb-list"), (bill, rpid, verdict) => {
+    const view = $("#nb-review").value;
+    const hide = (view === "" && verdict === "not_relevant") || (view === "todo" && verdict) ||
+                 (view === "relevant" && verdict !== "relevant") || (view === "not_relevant" && verdict !== "not_relevant");
+    const r = state.nb.results.find((x) => x.bill === bill);
+    const allDismissed = r && (r.agenda || []).every((a) => a.review === "not_relevant");
+    if (hide && (view !== "" || allDismissed)) {
+      state.nb.results = state.nb.results.filter((x) => x.bill !== bill);
+      state.nb.total = Math.max(0, state.nb.total - 1);
+      renderNewBills();
+    }
+  });
+  $("#nb-list").querySelectorAll(".nb-open").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); openBill(state.session, a.dataset.bill); }));
 }
 
 // ------------------------------------------------------------------ find bills
@@ -649,6 +781,7 @@ function renderResults() {
       <div class="result-main" data-bill="${esc(r.bill)}">
         <div class="result-top"><span class="billno">${esc(r.display)}</span>${r.author ? `<span class="by">by ${esc(r.author)}</span>` : ""}${stagePill(r.stage, r.stage_label, closed)}</div>
         ${summaryCell(r)}
+        ${snippetHtml(r.snippet)}
         <p class="last"><b>Last action:</b> ${esc(r.last_action || "No action recorded")}${r.last_action_date ? " · " + fmtDate(r.last_action_date) : ""}</p>
         ${officialTitle(r)}
         ${agendaTags(r.agenda)}
@@ -800,6 +933,7 @@ function renderDrawer(d) {
         <label for="t-priority">Priority<select id="t-priority">${optionList(state.config.priorities, t.priority)}</select></label>
         <label for="t-labels">Labels (comma separated)<input id="t-labels" value="${esc(t.labels)}" placeholder="e.g. education, budget"></label>
       </div>
+      <label for="t-reason">Why this position<input id="t-reason" maxlength="1000" value="${esc(t.reason || "")}" placeholder="The reason for the Chamber’s position, for the record"></label>
       <label for="t-notes">Notes<textarea id="t-notes" placeholder="Talking points, contacts, next steps">${esc(t.notes)}</textarea></label>
       <div class="row-end">
         <button class="btn" type="submit">Save</button>
@@ -835,8 +969,8 @@ function renderDrawer(d) {
     $("#t-priority").addEventListener("change", (e) => saveTracking(d.bill, { priority: e.target.value }));
     $("#track-form").addEventListener("submit", async (e) => {
       e.preventDefault();
-      const row = await saveTracking(d.bill, { notes: $("#t-notes").value, labels: $("#t-labels").value });
-      if (row) d.tracked = { ...d.tracked, notes: row.notes, labels: row.labels };
+      const row = await saveTracking(d.bill, { notes: $("#t-notes").value, labels: $("#t-labels").value, reason: $("#t-reason").value });
+      if (row) d.tracked = { ...d.tracked, notes: row.notes, labels: row.labels, reason: row.reason };
     });
     $("#untrack").addEventListener("click", () => {
       $("#untrack-area").innerHTML = `<span class="confirm">Remove ${esc(d.display)} and its notes? <button class="btn btn-danger btn-sm" type="button" id="untrack-yes">Remove</button><button class="btn btn-ghost btn-sm" type="button" id="untrack-no">Cancel</button></span>`;

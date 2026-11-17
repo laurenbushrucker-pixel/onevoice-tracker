@@ -28,6 +28,7 @@
   </div>
   <nav class="wrap tabs" aria-label="Views">
     <a href="#agenda" data-view="agenda">Agenda</a>
+    <a href="#newbills" data-view="newbills">New bills</a>
     <a href="#mine" data-view="mine">My bills <span class="count" id="count-mine"></span></a>
     <a href="#find" data-view="find">Find bills</a>
     <a href="#updates" data-view="updates">Updates <span class="count count-alert" id="count-updates" hidden></span></a>
@@ -55,6 +56,30 @@
     </div>
     <div id="agenda-list" class="agenda-list"></div>
     <p class="hint">Bills are matched by keywords in their title, subjects and full bill text. A keyword in the title counts on its own; in the bill text, a priority's keywords must appear at least 3 times. A match means a bill is worth a look, not that it supports or opposes the agenda. Use <b>Edit keywords</b> to tune what each priority catches.</p>
+  </section>
+
+  <!-- New bills: everything from the alert emails, as a running list -->
+  <section id="view-newbills" class="view" hidden>
+    <form class="toolbar" id="nb-form">
+      <input id="nb-q" type="search" placeholder="Search all bill text: keyword, “exact phrase”, or bill number" aria-label="Keyword search">
+      <select id="nb-priority" aria-label="Agenda priority"><option value="">All agenda priorities</option></select>
+      <select id="nb-review" aria-label="Relevance">
+        <option value="">To review and relevant</option><option value="todo">Not reviewed yet</option>
+        <option value="relevant">Marked relevant</option><option value="not_relevant">Marked not relevant</option><option value="all">All</option>
+      </select>
+      <select id="nb-position" aria-label="Chamber position">
+        <option value="">Any position</option><option value="none">No position yet</option>
+        <option value="support">Support</option><option value="oppose">Oppose</option><option value="monitor">Monitor</option><option value="neutral">Neutral</option>
+      </select>
+      <button class="btn" type="submit">Search</button>
+    </form>
+    <p class="hint" id="nb-meta"></p>
+    <ol class="nb-list" id="nb-list"></ol>
+    <div class="center"><button class="btn btn-ghost" id="nb-more" type="button" hidden>Show more</button></div>
+    <div class="empty" id="nb-empty" hidden>
+      <h2>No matching bills yet</h2>
+      <p>Bills that match the OneVoice agenda show up here as they’re filed, with everything from the alert emails: summary, subject area, status, and a place to record the Chamber’s position.</p>
+    </div>
   </section>
 
   <!-- My bills -->
@@ -94,7 +119,7 @@
   <section id="view-find" class="view" hidden>
     <a class="back-link" id="find-back" href="#agenda" hidden>&larr; Back to the agenda</a>
     <form class="toolbar" id="find-form">
-      <input id="find-q" type="search" placeholder="Keyword or bill number (e.g. teacher pay, SB 206)" aria-label="Search">
+      <input id="find-q" type="search" placeholder="Search all bill text: keyword, “exact phrase”, or bill number" aria-label="Search">
       <select id="find-agenda" aria-label="OneVoice priority">
         <option value="">All bills</option><option value="any">Matches any agenda item</option>
       </select>
