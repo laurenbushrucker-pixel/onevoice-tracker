@@ -555,7 +555,7 @@ async function saveSettings(e) {
   try {
     await api("/api/settings", { method: "PUT", body: {
       alerts_enabled: $("#s-enabled").checked,
-      recipients: $("#s-recipients").value.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean),
+      recipients: $("#s-recipients").value.split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean),
       app_url: $("#s-url").value.trim(),
       checkin_enabled: $("#s-checkin").checked,
       checkin_backup: $("#s-checkin-backup").checked,
@@ -571,8 +571,9 @@ async function saveSettings(e) {
 async function testEmail() {
   $("#s-test").disabled = true;
   try {
-    const r = await api("/api/settings/test-email", { method: "POST" });
-    toast(`Test email sent to ${r.to.join(", ")}`);
+    // Uses the addresses in the box right now, even before Save settings.
+    const r = await api("/api/settings/test-email", { method: "POST", body: { to: $("#s-recipients").value } });
+    toast(`Test email sent to ${r.to.join(", ")}.` + (r.unsaved.length ? " Click Save settings to send real alerts to the new address too." : ""));
   } catch (err) { toast(err.message, true); } finally { $("#s-test").disabled = false; }
 }
 

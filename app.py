@@ -1959,8 +1959,7 @@ def api_settings_update():
     body = request.get_json(force=True) or {}
     s = settings()
     if "recipients" in body:
-        addrs = [a.strip() for a in body["recipients"] if a and a.strip()]
-        bad = [a for a in addrs if "@" not in a or " " in a]
+        addrs, bad = parse_addresses(body["recipients"])
         if bad:
             abort(400, f"These don't look like email addresses: {', '.join(bad)}")
         s["recipients"] = addrs[:50]
@@ -1978,9 +1977,29 @@ def api_settings_update():
     return api_settings()
 
 
+EMAIL_RE = re.compile(r"^[^@\s<>,;]+@[^@\s<>,;]+\.[^@\s<>,;]+$")
+
+
+def parse_addresses(raw) -> tuple[list[str], list[str]]:
+    """Split addresses on new lines, commas, semicolons or spaces; return (good, bad)."""
+    items = raw if isinstance(raw, list) else [raw or ""]
+    addrs = [a.strip() for chunk in items for a in re.split(r"[\s,;]+", str(chunk)) if a.strip()]
+    good = list(dict.fromkeys(a for a in addrs if EMAIL_RE.match(a)))
+    return good, [a for a in addrs if not EMAIL_RE.match(a)]
+
+
 @app.post("/api/settings/test-email")
 def api_test_email():
     st = settings()
+    body = request.get_json(silent=True) or {}
+    if "to" in body:  # send to what's typed in the box, saved or not
+        to, bad = parse_addresses(body["to"])
+        if bad:
+            return jsonify(error=f"These don't look like email addresses: {', '.join(bad)}"), 400
+        if not to:
+            return jsonify(error="Type at least one email address in the box first."), 400
+    else:
+        to = st["recipients"]
     sample = {
         "display": "HB 0000", "author": "Example Author (H)",
         "title": "Schools; example title for a test alert; effective date.",
@@ -1995,10 +2014,10 @@ def api_test_email():
     }
     subject, text, html_body = ov.render_alert(sample, st["app_url"], session_name(DEFAULT_SESSION))
     try:
-        ov.send_email(st["recipients"], "[Test] " + subject, text, html_body)
+        ov.send_email(to, "[Test] " + subject, text, html_body)
     except Exception as e:  # noqa: BLE001 - show the reason to the user
         return jsonify(error=f"The test email was not sent: {e}"), 400
-    return jsonify(ok=True, to=st["recipients"])
+    return jsonify(ok=True, to=to, unsaved=[a for a in to if a not in st["recipients"]])
 
 
 @app.get("/api/export.csv")
