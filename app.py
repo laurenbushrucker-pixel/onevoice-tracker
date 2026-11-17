@@ -19,6 +19,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import hmac
 import secrets
@@ -38,7 +39,11 @@ DB_PATH = Path(os.environ.get("BILLTRACKER_DB", ROOT / "data" / "tracker.db"))
 DEFAULT_SESSION = os.environ.get("BILLTRACKER_SESSION", "2700")
 # Sessions whose new filings trigger email alerts (comma separated).
 ALERT_SESSIONS = [s.strip().upper() for s in os.environ.get("BILLTRACKER_ALERT_SESSIONS", DEFAULT_SESSION).split(",") if s.strip()]
-REFRESH_HOURS = float(os.environ.get("BILLTRACKER_REFRESH_HOURS", "6"))  # 0 = off
+REFRESH_HOURS = float(os.environ.get("BILLTRACKER_REFRESH_HOURS", "1"))  # how often tracked bills are re-checked; 0 = off
+CENTRAL = ZoneInfo("America/Chicago")
+CHECKIN_HOUR = int(os.environ.get("BILLTRACKER_CHECKIN_HOUR", "7"))  # daily check-in email, Central time
+BACKUPS_KEPT = 14
+STARTED_AT = datetime.now(timezone.utc)
 INDEX_HOURS = float(os.environ.get("BILLTRACKER_INDEX_HOURS", "6"))  # full index rebuild, the safety net; 0 = off
 # How often to look for newly filed bills. Speed is the point, so the default is every 10 minutes.
 FILINGS_MINUTES = float(os.environ.get("BILLTRACKER_FILINGS_MINUTES",
@@ -119,6 +124,12 @@ CREATE TABLE IF NOT EXISTS texts (
   session TEXT NOT NULL, bill TEXT NOT NULL,
   version TEXT, source_url TEXT, body BLOB, chars INTEGER, fetched_at TEXT, error TEXT,
   PRIMARY KEY (session, bill));
+CREATE TABLE IF NOT EXISTS events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, kind TEXT, ok INTEGER, detail TEXT, data TEXT DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS reviews (
+  session TEXT NOT NULL, bill TEXT NOT NULL, priority_id TEXT NOT NULL,
+  verdict TEXT, keywords TEXT DEFAULT '[]', at TEXT,
+  PRIMARY KEY (session, bill, priority_id));
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -142,6 +153,12 @@ def init_db() -> None:
         for col in ("first_seen", "matched_at", "author"):
             if col not in cols:  # upgrade a database made by an earlier version
                 c.execute(f"ALTER TABLE bills ADD COLUMN {col} TEXT")
+        ucols = {r["name"] for r in c.execute("PRAGMA table_info(updates)")}
+        if "emailed" not in ucols:
+            c.execute("ALTER TABLE updates ADD COLUMN emailed INTEGER DEFAULT 0")
+            c.execute("UPDATE updates SET emailed=2")  # don't email actions found before this feature existed
+        if "category" not in ucols:
+            c.execute("ALTER TABLE updates ADD COLUMN category TEXT")
         if "checked_at" not in {r["name"] for r in c.execute("PRAGMA table_info(summaries)")}:
             c.execute("ALTER TABLE summaries ADD COLUMN checked_at TEXT")
         if not c.execute("SELECT 1 FROM priorities LIMIT 1").fetchone():
@@ -175,7 +192,18 @@ def settings() -> dict:
         "recipients": s.get("recipients", DEFAULT_RECIPIENTS),
         "alerts_enabled": s.get("alerts_enabled", True),
         "app_url": s.get("app_url", APP_URL),
+        "checkin_enabled": s.get("checkin_enabled", True),
+        "checkin_backup": s.get("checkin_backup", True),
+        "movement_enabled": s.get("movement_enabled", True),
+        "movement_categories": s.get("movement_categories", ok.DEFAULT_MOVEMENT_CATEGORIES),
     }
+
+
+def log_event(kind: str, ok_: bool, detail: str = "", **data) -> None:
+    """Record what the tracker did, for the daily check-in and problem alerts."""
+    with db() as c:
+        c.execute("INSERT INTO events(at,kind,ok,detail,data) VALUES(?,?,?,?,?)",
+                  (now_iso(), kind, int(bool(ok_)), (detail or "")[:500], json.dumps(data)))
 
 
 def get_priorities() -> list[dict]:
@@ -370,7 +398,9 @@ def send_alerts(only: tuple[str, str] | None = None) -> dict:
                 ov.send_email(st["recipients"], subject, text, html_body)
             except Exception as e:  # noqa: BLE001 - keep pending and report; retried next check
                 meta_set("last_alert_error", {"at": now_iso(), "error": str(e)})
+                log_event("alert_email", False, str(e), bill=bill)
                 return {"sent": sent, "error": str(e)}
+            log_event("alert_email", True, bill=bill)
             with db() as c:
                 c.execute("UPDATE matches SET alert='sent', alerted_at=? WHERE alert='pending' AND session=? AND bill=?",
                           (now_iso(), session, bill))
@@ -463,8 +493,8 @@ def record_updates(session: str, bill: str, new_actions: list[ok.Action]) -> Non
             return
         for a in new_actions:
             c.execute(
-                "INSERT INTO updates(session,bill,action,date,chamber,detected_at) VALUES(?,?,?,?,?,?)",
-                (session, bill, a.action, a.date, a.chamber, now_iso()),
+                "INSERT INTO updates(session,bill,action,date,chamber,detected_at,category) VALUES(?,?,?,?,?,?,?)",
+                (session, bill, a.action, a.date, a.chamber, now_iso(), ok.classify_action(a.action, a.chamber, bill)),
             )
 
 
@@ -481,7 +511,61 @@ def refresh_tracked(session: str | None = None, progress=None) -> int:
             continue
         with db() as c:
             c.execute("UPDATE tracked SET last_checked=? WHERE session=? AND bill=?", (now_iso(), r["session"], r["bill"]))
+    send_movement_emails()
     return len(rows)
+
+
+CATEGORY_LABEL = dict(ok.ACTION_CATEGORIES)
+
+
+def send_movement_emails() -> dict:
+    """Email each tracked bill that has new actions of the kinds chosen in settings."""
+    st = settings()
+    with db() as c:
+        rows = c.execute(
+            """SELECT u.id, u.session, u.bill, u.action, u.date, u.chamber, u.category, u.detected_at,
+                      t.position, b.title, b.author, b.stage, s.summary
+               FROM updates u JOIN tracked t ON t.session=u.session AND t.bill=u.bill
+               LEFT JOIN bills b ON b.session=u.session AND b.bill=u.bill
+               LEFT JOIN summaries s ON s.session=u.session AND s.bill=u.bill
+               WHERE u.emailed=0 ORDER BY u.session, u.bill, u.date, u.id""").fetchall()
+    if not rows:
+        return {"sent": 0}
+    chosen = set(st["movement_categories"])
+    skip, by_bill = [], {}
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    for r in rows:
+        cat = r["category"] or ok.classify_action(r["action"], r["chamber"], r["bill"])
+        if not st["movement_enabled"] or cat not in chosen or (not ov.email_configured() and r["detected_at"] < stale):
+            skip.append(r["id"])
+            continue
+        by_bill.setdefault((r["session"], r["bill"]), []).append((r, cat))
+    with db() as c:
+        c.executemany("UPDATE updates SET emailed=2 WHERE id=?", [(i,) for i in skip])
+    if not by_bill or not ov.email_configured() or not st["recipients"]:
+        return {"sent": 0}
+    sent = 0
+    for (session, bill), items in by_bill.items():
+        r0 = items[0][0]
+        item = {
+            "display": ok.display_bill(bill), "author": r0["author"] or "", "title": r0["title"] or "",
+            "summary": r0["summary"] or "", "url": ok.bill_url(bill, session), "position": r0["position"] or "",
+            "stage_label": ok.STAGE_LABEL.get(r0["stage"] or "unknown", ""),
+            "actions": [{"date": r["date"], "chamber": r["chamber"], "action": r["action"], "category_label": CATEGORY_LABEL.get(cat, "")}
+                        for r, cat in items],
+        }
+        subject, text, html_body = ov.render_movement(item, st["app_url"])
+        try:
+            ov.send_email(st["recipients"], subject, text, html_body)
+        except Exception as e:  # noqa: BLE001 - keep them queued; retried next check
+            log_event("movement_email", False, str(e))
+            meta_set("last_alert_error", {"at": now_iso(), "error": str(e)})
+            break
+        with db() as c:
+            c.executemany("UPDATE updates SET emailed=1 WHERE id=?", [(r["id"],) for r, _ in items])
+        log_event("movement_email", True, bill=bill)
+        sent += 1
+    return {"sent": sent}
 
 
 def build_index(session: str, progress=None) -> int:
@@ -606,7 +690,7 @@ def summarize_pending(session: str, progress=None, limit: int = SUMMARY_BATCH, b
     return {"summarized": done, "failed": failed}
 
 
-def probe_filings(session: str, progress=None) -> list[str]:
+def probe_filings(session: str, progress=None, errors: list | None = None) -> list[str]:
     """Find newly filed measures by trying the next unused bill numbers."""
     with db() as c:
         top = {r["bill_type"]: r["n"] for r in c.execute(
@@ -623,7 +707,9 @@ def probe_filings(session: str, progress=None) -> list[str]:
             bill = f"{btype}{n}"
             try:
                 d = ok.fetch_bill(bill, session)
-            except RuntimeError:
+            except RuntimeError as e:
+                if errors is not None:
+                    errors.append(str(e))
                 break
             if d.found:
                 store_detail(d)
@@ -639,7 +725,11 @@ def probe_filings(session: str, progress=None) -> list[str]:
 def check_filings(session: str, progress=None) -> dict:
     """Find new filings, read their full text, match them, and email each match
     as soon as it's ready (summary first, when AI summaries are on)."""
-    new = probe_filings(session, progress)
+    errors: list[str] = []
+    try:
+        new = probe_filings(session, progress, errors=errors)
+    except TypeError:  # a stand-in probe without the errors argument (tests)
+        new = probe_filings(session, progress)
     created = match_session(session, fetch_text=True)
     with db() as c:
         pending = [r["bill"] for r in c.execute(
@@ -658,7 +748,12 @@ def check_filings(session: str, progress=None) -> dict:
     result = {"new_bills": len(new), "new_matches": created, "sent": sent}
     if error:
         result["error"] = error
+    site_ok = len(errors) < len(FILING_TYPES)  # reached the site for at least some bill types
+    result["site_errors"] = len(errors)
     meta_set(f"filings:{session}", {"at": now_iso(), **result})
+    if site_ok:
+        meta_set("last_filings_ok", now_iso())
+    log_event("filings", site_ok, errors[0] if errors else "", new_bills=len(new), new_matches=created, sent=sent)
     return result
 
 
@@ -681,6 +776,7 @@ def start_job(kind: str, session: str | None, fn) -> bool:
             job.update(running=False, finished=now_iso(), result=result, error=None)
         except Exception as e:  # noqa: BLE001 - report any failure to the UI
             job.update(running=False, finished=now_iso(), error=str(e))
+            log_event(kind, False, str(e))
         finally:
             _job_lock.release()
 
@@ -703,6 +799,10 @@ def scheduler() -> None:
     while True:
         time.sleep(60)
         try:
+            housekeeping()
+        except Exception as e:  # noqa: BLE001 - keep the scheduler alive
+            print("housekeeping:", e, flush=True)
+        try:
             for s in ALERT_SESSIONS:
                 if _due(f"filings:{s}", FILINGS_HOURS):
                     start_job("filings", s, lambda p, s=s: check_filings(s, p))
@@ -721,6 +821,218 @@ def scheduler() -> None:
             pass
 
 
+# ------------------------------------------------- health, check-in, backups
+
+
+PROBLEMS = {
+    "checks": ("Checks for new bills have stopped", "Checks for new bills are working again",
+               "This usually means oklegislature.gov is down or very slow. The tracker keeps retrying on its own. "
+               "If it lasts more than a few hours, open SSH in Google Cloud and run: sudo systemctl restart onevoice-tracker"),
+    "site": ("The Legislature's website isn't reading correctly", "The Legislature's website is reading correctly again",
+             "oklegislature.gov may be down, or its page layout may have changed. If this lasts more than a day, "
+             "the part of the tracker that reads the website (oklegis.py) may need an update."),
+    "email": ("Alert emails aren't sending", "Alert emails are sending again",
+              "Check the mail settings on the server (run the setup script again and re-enter the mail server, username "
+              "and app password), then use Send a test email under Alerts & settings."),
+}
+
+
+def run_canary() -> None:
+    """Read one known bill to prove the tracker can still read oklegislature.gov."""
+    with db() as c:
+        r = c.execute("""SELECT bill FROM bills WHERE session=? AND last_action_date IS NOT NULL
+                         ORDER BY bill_type DESC, bill_num LIMIT 1""", (DEFAULT_SESSION,)).fetchone()
+    bill = r["bill"] if r else "SB1"
+    try:
+        d = ok.fetch_bill(bill, DEFAULT_SESSION)
+        good = d.found and bool(d.title) and bool(d.actions)
+        detail = "" if good else f"Could not read the title and history of {ok.display_bill(bill)}."
+    except RuntimeError as e:
+        good, detail = False, f"Could not reach oklegislature.gov: {e}"
+    prev = meta_get("canary") or {}
+    fails = 0 if good else prev.get("fails", 0) + 1
+    meta_set("canary", {"at": now_iso(), "ok": good, "detail": detail, "fails": fails, "bill": bill})
+    log_event("canary", good, detail, bill=bill)
+
+
+def active_problems() -> dict[str, str]:
+    """{kind: message} for problems happening right now."""
+    out: dict[str, str] = {}
+    now = datetime.now(timezone.utc)
+    if FILINGS_MINUTES > 0:
+        window = timedelta(minutes=max(45, 3 * FILINGS_MINUTES))
+        last = meta_get("last_filings_ok")
+        last_dt = datetime.fromisoformat(last) if last else STARTED_AT
+        if now - max(last_dt, STARTED_AT) > window:
+            when = last_dt.astimezone(CENTRAL).strftime("%-I:%M %p on %b %-d") if last else "the tracker started"
+            out["checks"] = f"The tracker hasn't been able to check for new bills since {when} (Central)."
+    canary = meta_get("canary") or {}
+    if canary.get("fails", 0) >= 2:
+        out["site"] = canary.get("detail") or "Bill pages on oklegislature.gov aren't reading correctly."
+    err = meta_get("last_alert_error")
+    if err and now - datetime.fromisoformat(err["at"]) < timedelta(hours=3):
+        out["email"] = f"The last alert email failed to send: {err['error']}"
+    return out
+
+
+def watch_problems() -> None:
+    """Email when a problem starts (reminder every 12 hours) and when it clears."""
+    state = meta_get("problems") or {}
+    current = active_problems()
+    st = settings()
+    now = datetime.now(timezone.utc)
+    changed = False
+    for kind, message in current.items():
+        p = state.get(kind) or {"since": now_iso()}
+        last = p.get("emailed_at")
+        if not last or now - datetime.fromisoformat(last) > timedelta(hours=12):
+            title, _, fix = PROBLEMS[kind]
+            if _try_send(st, *ov.render_problem(title, message, fix, False, st["app_url"])):
+                p["emailed_at"] = now_iso()
+        p["message"] = message
+        state[kind] = p
+        changed = True
+    for kind in [k for k in state if k not in current]:
+        p = state.pop(kind)
+        changed = True
+        if p.get("emailed_at"):
+            _, fixed_title, _ = PROBLEMS[kind]
+            _try_send(st, *ov.render_problem(fixed_title, "No action is needed.", "", True, st["app_url"]))
+    if changed:
+        meta_set("problems", state)
+
+
+def _try_send(st: dict, subject: str, text: str, html_body: str, attachments=None) -> bool:
+    if not ov.email_configured() or not st["recipients"]:
+        return False
+    try:
+        ov.send_email(st["recipients"], subject, text, html_body, attachments)
+        return True
+    except Exception as e:  # noqa: BLE001
+        log_event("system_email", False, str(e))
+        return False
+
+
+def export_backup() -> dict:
+    """Everything people entered: tracked bills, notes, positions, relevance marks,
+    keyword edits and settings (never passwords or keys)."""
+    with db() as c:
+        tracked = [dict(r) for r in c.execute("SELECT * FROM tracked ORDER BY session, bill")]
+        reviews = [dict(r) for r in c.execute("SELECT * FROM reviews ORDER BY session, bill, priority_id")]
+    st = settings()
+    return {"app": "OneVoice Tracker", "format": 1, "exported_at": now_iso(),
+            "tracked": tracked, "reviews": reviews, "priorities": get_priorities(),
+            "settings": {k: st[k] for k in ("recipients", "alerts_enabled", "app_url", "checkin_enabled",
+                                             "checkin_backup", "movement_enabled", "movement_categories")}}
+
+
+def restore_backup(data: dict) -> dict:
+    if data.get("app") != "OneVoice Tracker":
+        raise ValueError("This file isn't a OneVoice Tracker backup.")
+    with db() as c:
+        for t in data.get("tracked", []):
+            c.execute("""INSERT OR REPLACE INTO tracked(session,bill,position,priority,notes,labels,added_at,last_checked)
+                         VALUES(?,?,?,?,?,?,?,?)""",
+                      (t["session"], t["bill"], t.get("position"), t.get("priority"), t.get("notes", ""),
+                       t.get("labels", ""), t.get("added_at") or now_iso(), t.get("last_checked")))
+        for r in data.get("reviews", []):
+            c.execute("INSERT OR REPLACE INTO reviews(session,bill,priority_id,verdict,keywords,at) VALUES(?,?,?,?,?,?)",
+                      (r["session"], r["bill"], r["priority_id"], r.get("verdict"), r.get("keywords", "[]"), r.get("at")))
+        for p in data.get("priorities", []):
+            c.execute("UPDATE priorities SET keywords=?, exclude=?, enabled=? WHERE id=?",
+                      (json.dumps(p.get("keywords", [])), json.dumps(p.get("exclude", [])), int(bool(p.get("enabled", True))), p["id"]))
+    if data.get("settings"):
+        meta_set("settings", {**(meta_get("settings") or {}), **data["settings"]})
+    rematch_all_sessions()
+    return {"tracked": len(data.get("tracked", [])), "reviews": len(data.get("reviews", [])),
+            "priorities": len(data.get("priorities", []))}
+
+
+def make_local_backup() -> str:
+    """A full copy of the database on the server, one per day, newest 14 kept."""
+    folder = DB_PATH.parent / "backups"
+    folder.mkdir(parents=True, exist_ok=True)
+    target = folder / f"tracker-{datetime.now(CENTRAL).date().isoformat()}.db"
+    src, dst = sqlite3.connect(DB_PATH), sqlite3.connect(target)
+    with dst:
+        src.backup(dst)
+    src.close()
+    dst.close()
+    for old in sorted(folder.glob("tracker-*.db"))[:-BACKUPS_KEPT]:
+        old.unlink()
+    meta_set("last_backup", {"at": now_iso(), "file": target.name})
+    return str(target)
+
+
+def checkin_stats() -> dict:
+    since = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    with db() as c:
+        ev = c.execute("SELECT kind, ok, data FROM events WHERE at >= ?", (since,)).fetchall()
+        tracked = c.execute("SELECT COUNT(*) n FROM tracked").fetchone()["n"]
+    def n(kind, ok_=None):
+        return sum(1 for e in ev if e["kind"] == kind and (ok_ is None or e["ok"] == ok_))
+    def total(kind, field):
+        return sum(json.loads(e["data"] or "{}").get(field, 0) for e in ev if e["kind"] == kind)
+    last = meta_get("last_filings_ok")
+    last_txt = datetime.fromisoformat(last).astimezone(CENTRAL).strftime("%-I:%M %p") if last else "never"
+    problems = list(active_problems().values())
+    failed = n("filings", 0)
+    if failed and "checks" not in active_problems():
+        problems_info = f"{failed} of {n('filings')} checks couldn't reach the site (it recovered)"
+    else:
+        problems_info = None
+    rows = [
+        ("Checks for new bills", f"{n('filings', 1)} completed" + (f", {failed} failed" if failed else "")),
+        ("Last successful check", last_txt + " Central"),
+        ("New bills found", total("filings", "new_bills")),
+        ("New bills matching the agenda", total("filings", "new_matches")),
+        ("New-bill alerts emailed", n("alert_email", 1)),
+        ("Tracked-bill updates emailed", n("movement_email", 1)),
+        ("Bills you're tracking", tracked),
+    ]
+    if problems_info:
+        rows.append(("Note", problems_info))
+    return {"date_label": datetime.now(CENTRAL).strftime("%A, %B %-d, %Y"), "ok": not problems,
+            "problems": problems, "rows": rows}
+
+
+def send_checkin() -> bool:
+    st = settings()
+    stats = checkin_stats()
+    attachments = None
+    if st["checkin_backup"]:
+        data = json.dumps(export_backup(), indent=1).encode("utf-8")
+        name = f"onevoice-backup-{datetime.now(CENTRAL).date().isoformat()}.json"
+        attachments = [(name, data, "application/json")]
+        stats["backup_note"] = (f"Attached: {name}, a backup of your tracked bills, notes, positions, relevance marks and "
+                                "keyword edits. Keep these emails; any one of them can restore the tracker.")
+    sent = _try_send(st, *ov.render_checkin(stats, st["app_url"]), attachments=attachments)
+    log_event("checkin", sent)
+    meta_set("last_checkin", {"at": now_iso(), "sent": sent, "ok": stats["ok"]})
+    return sent
+
+
+def housekeeping() -> None:
+    """Runs every minute next to the scheduled jobs: site check, problem alerts,
+    and once a day the backup and the check-in email."""
+    canary = meta_get("canary") or {}
+    if _due("canary", 1 if canary.get("ok", True) else 1 / 6):  # re-check after 10 minutes when it failed
+        run_canary()
+    watch_problems()
+    now_local = datetime.now(CENTRAL)
+    today = now_local.date().isoformat()
+    if now_local.hour >= CHECKIN_HOUR and meta_get("last_checkin_date") != today:
+        meta_set("last_checkin_date", today)
+        try:
+            make_local_backup()
+        except Exception as e:  # noqa: BLE001
+            log_event("backup", False, str(e))
+        with db() as c:
+            c.execute("DELETE FROM events WHERE at < ?", ((datetime.now(timezone.utc) - timedelta(days=45)).isoformat(),))
+        if settings()["checkin_enabled"]:
+            send_checkin()
+
+
 # ---------------------------------------------------------------- helpers
 
 
@@ -731,10 +1043,13 @@ def agenda_for(session: str, bills: list[str]) -> dict[str, list[dict]]:
     with db() as c:
         for i in range(0, len(bills), 500):
             chunk = bills[i:i + 500]
-            q = f"SELECT bill, priority_id, keywords, alert, matched_at FROM matches WHERE session=? AND bill IN ({','.join('?' * len(chunk))})"
+            q = f"""SELECT m.bill, m.priority_id, m.keywords, m.alert, m.matched_at, rv.verdict FROM matches m
+                    LEFT JOIN reviews rv ON rv.session=m.session AND rv.bill=m.bill AND rv.priority_id=m.priority_id
+                    WHERE m.session=? AND m.bill IN ({','.join('?' * len(chunk))})"""
             for r in c.execute(q, [session] + chunk):
                 out.setdefault(r["bill"], []).append(
-                    {"id": r["priority_id"], "keywords": json.loads(r["keywords"]), "alert": r["alert"], "matched_at": r["matched_at"]})
+                    {"id": r["priority_id"], "keywords": json.loads(r["keywords"]), "alert": r["alert"],
+                     "matched_at": r["matched_at"], "review": r["verdict"]})
     return out
 
 
@@ -1028,10 +1343,13 @@ def api_search():
     if stage:
         where.append("b.stage=?")
         args.append(stage)
+    dismissed = request.args.get("dismissed") or ""  # "" = hide not-relevant, "only" = show only them, "all"
+    review_join = ("LEFT JOIN reviews rv ON rv.session=m.session AND rv.bill=m.bill AND rv.priority_id=m.priority_id")
+    review_cond = {"only": "AND rv.verdict='not_relevant'", "all": ""}.get(dismissed, "AND COALESCE(rv.verdict,'')!='not_relevant'")
     if agenda == "any":
-        where.append("EXISTS (SELECT 1 FROM matches m WHERE m.session=b.session AND m.bill=b.bill)")
+        where.append(f"EXISTS (SELECT 1 FROM matches m {review_join} WHERE m.session=b.session AND m.bill=b.bill {review_cond})")
     elif agenda:
-        where.append("EXISTS (SELECT 1 FROM matches m WHERE m.session=b.session AND m.bill=b.bill AND m.priority_id=?)")
+        where.append(f"EXISTS (SELECT 1 FROM matches m {review_join} WHERE m.session=b.session AND m.bill=b.bill AND m.priority_id=? {review_cond})")
         args.append(agenda)
     sql_where = " AND ".join(where)
     order = "b.first_seen DESC, b.bill_type, b.bill_num" if request.args.get("sort") == "newest" else "b.bill_type, b.bill_num"
@@ -1216,9 +1534,14 @@ def api_agenda():
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     with db() as c:
         counts = {r["priority_id"]: dict(r) for r in c.execute(
-            """SELECT priority_id, COUNT(*) total,
-                      SUM(CASE WHEN alert IN ('pending','sent','skipped') AND matched_at>=? THEN 1 ELSE 0 END) recent
-               FROM matches WHERE session=? GROUP BY priority_id""", (week_ago, s))}
+            """SELECT m.priority_id,
+                      SUM(CASE WHEN COALESCE(rv.verdict,'')!='not_relevant' THEN 1 ELSE 0 END) total,
+                      SUM(CASE WHEN rv.verdict='not_relevant' THEN 1 ELSE 0 END) dismissed,
+                      SUM(CASE WHEN rv.verdict='relevant' THEN 1 ELSE 0 END) relevant,
+                      SUM(CASE WHEN m.alert IN ('pending','sent','skipped') AND m.matched_at>=?
+                               AND COALESCE(rv.verdict,'')!='not_relevant' THEN 1 ELSE 0 END) recent
+               FROM matches m LEFT JOIN reviews rv ON rv.session=m.session AND rv.bill=m.bill AND rv.priority_id=m.priority_id
+               WHERE m.session=? GROUP BY m.priority_id""", (week_ago, s))}
         tracked = {r["priority_id"]: r["n"] for r in c.execute(
             """SELECT m.priority_id, COUNT(*) n FROM matches m JOIN tracked t ON t.session=m.session AND t.bill=m.bill
                WHERE m.session=? GROUP BY m.priority_id""", (s,))}
@@ -1226,7 +1549,9 @@ def api_agenda():
     out = []
     for p in get_priorities():
         cnt = counts.get(p["id"], {})
-        out.append({**p, "matches": cnt.get("total", 0), "recent": cnt.get("recent", 0) or 0, "tracked": tracked.get(p["id"], 0)})
+        out.append({**p, "matches": cnt.get("total", 0) or 0, "recent": cnt.get("recent", 0) or 0,
+                    "dismissed": cnt.get("dismissed", 0) or 0, "relevant": cnt.get("relevant", 0) or 0,
+                    "tracked": tracked.get(p["id"], 0)})
     return jsonify(priorities=out, bills_matching=any_match)
 
 
@@ -1277,6 +1602,71 @@ def api_agenda_preview():
     return jsonify(total=total, sample=sample)
 
 
+@app.post("/api/review")
+def api_review():
+    """Mark a bill Relevant or Not relevant for one agenda priority (verdict null clears it)."""
+    body = request.get_json(force=True) or {}
+    session, bill, pid, verdict = (body.get("session") or DEFAULT_SESSION).upper(), want_bill(body.get("bill") or ""), body.get("priority_id"), body.get("verdict")
+    if verdict not in ("relevant", "not_relevant", None):
+        abort(400, "verdict must be relevant, not_relevant or null")
+    with db() as c:
+        m = c.execute("SELECT keywords FROM matches WHERE session=? AND bill=? AND priority_id=?", (session, bill, pid)).fetchone()
+        if not m:
+            abort(404, "That bill doesn't match this priority.")
+        if verdict is None:
+            c.execute("DELETE FROM reviews WHERE session=? AND bill=? AND priority_id=?", (session, bill, pid))
+        else:
+            c.execute("INSERT OR REPLACE INTO reviews(session,bill,priority_id,verdict,keywords,at) VALUES(?,?,?,?,?,?)",
+                      (session, bill, pid, verdict, m["keywords"], now_iso()))
+    return jsonify(ok=True, verdict=verdict)
+
+
+@app.get("/api/agenda/<pid>/noise")
+def api_agenda_noise(pid):
+    """Which keywords are behind bills marked Not relevant (and Relevant) for a priority."""
+    stats: dict[str, dict[str, int]] = {}
+    with db() as c:
+        for r in c.execute("SELECT verdict, keywords FROM reviews WHERE priority_id=?", (pid,)):
+            for ev in json.loads(r["keywords"] or "[]"):
+                kw = ev.split(" (")[0]
+                stats.setdefault(kw, {"not_relevant": 0, "relevant": 0})[r["verdict"]] += 1
+    out = sorted(({"keyword": k, **v} for k, v in stats.items()), key=lambda x: (-x["not_relevant"], x["relevant"]))
+    return jsonify(out)
+
+
+@app.get("/api/health")
+def api_health():
+    def local(iso):
+        return datetime.fromisoformat(iso).astimezone(CENTRAL).strftime("%b %-d, %-I:%M %p") if iso else None
+    canary, last_ok = meta_get("canary") or {}, meta_get("last_filings_ok")
+    backup, checkin = meta_get("last_backup") or {}, meta_get("last_checkin") or {}
+    alert, err = meta_get("last_alert"), meta_get("last_alert_error")
+    return jsonify(
+        problems=[{"kind": k, "title": PROBLEMS[k][0], "message": v, "fix": PROBLEMS[k][2]} for k, v in active_problems().items()],
+        checks={"last_ok": local(last_ok), "every_minutes": FILINGS_MINUTES},
+        site={"ok": canary.get("ok"), "at": local(canary.get("at")), "detail": canary.get("detail")},
+        email={"configured": ov.email_configured(), "last_sent": local(alert["at"]) if alert else None,
+               "last_error": err["error"] if err else None, "last_error_at": local(err["at"]) if err else None},
+        checkin={"at": local(checkin.get("at")), "sent": checkin.get("sent"), "hour": CHECKIN_HOUR},
+        backup={"at": local(backup.get("at")), "file": backup.get("file")},
+        refresh_hours=REFRESH_HOURS,
+    )
+
+
+@app.get("/api/backup.json")
+def api_backup():
+    data = json.dumps(export_backup(), indent=1)
+    name = f"onevoice-backup-{datetime.now(CENTRAL).date().isoformat()}.json"
+    return Response(data, mimetype="application/json", headers={"Content-Disposition": f"attachment; filename={name}"})
+
+
+@app.post("/api/checkin/send")
+def api_checkin_send():
+    if not send_checkin():
+        return jsonify(error="The check-in email couldn't be sent. Check the mail settings and the alert address."), 400
+    return jsonify(ok=True)
+
+
 # -------------------------------------------------------------- settings API
 
 
@@ -1293,6 +1683,9 @@ def api_settings():
         alert_sessions=[{"code": s, "name": session_name(s)} for s in ALERT_SESSIONS],
         filings_hours=FILINGS_HOURS,
         filings_minutes=FILINGS_MINUTES,
+        action_categories=[{"key": k, "label": v} for k, v in ok.ACTION_CATEGORIES],
+        checkin_hour=CHECKIN_HOUR,
+        refresh_hours=REFRESH_HOURS,
     )
 
 
@@ -1310,6 +1703,12 @@ def api_settings_update():
         s["alerts_enabled"] = bool(body["alerts_enabled"])
     if "app_url" in body:
         s["app_url"] = str(body["app_url"]).strip()[:300]
+    for key in ("checkin_enabled", "checkin_backup", "movement_enabled"):
+        if key in body:
+            s[key] = bool(body[key])
+    if "movement_categories" in body:
+        valid = dict(ok.ACTION_CATEGORIES)
+        s["movement_categories"] = [k for k in body["movement_categories"] if k in valid]
     meta_set("settings", s)
     return api_settings()
 
@@ -1372,6 +1771,16 @@ def main(argv: list[str]) -> None:
         s = argv[2] if len(argv) > 2 else DEFAULT_SESSION
         n = int(argv[3]) if len(argv) > 3 else SUMMARY_BATCH
         print(summarize_pending(s, say, limit=n))
+        return
+    if cmd == "restore":
+        if len(argv) < 3:
+            print("Usage: python app.py restore onevoice-backup-YYYY-MM-DD.json")
+            return
+        with open(argv[2], encoding="utf-8") as f:
+            print("Restored:", restore_backup(json.load(f)))
+        return
+    if cmd == "checkin":
+        print("Check-in sent." if send_checkin() else "Check-in NOT sent (check mail settings).")
         return
     if cmd == "filings":
         for s in ALERT_SESSIONS:

@@ -46,6 +46,48 @@ Each summary is labeled with its source on the website and in alert emails.
 gives an AI summary on filing day. This costs roughly 2–4 cents per bill. If
 the API call fails, the tracker falls back to the free summary.
 
+## Staying reliable
+
+- **Daily check-in** (7 a.m. Central, `BILLTRACKER_CHECKIN_HOUR`): an email
+  with the last 24 hours of activity and "All systems OK" or what needs
+  attention. If it doesn't arrive, the tracker may be down.
+- **Problem alerts**: an email right away if checks for new bills stop for 45
+  minutes, if the Legislature's pages stop reading correctly (checked hourly
+  against a known bill), or if alert emails fail. A reminder follows every 12
+  hours, and an "all clear" email when it's fixed. Problems also show as a red
+  banner on the website.
+- **Is everything working?** panel under Alerts & settings shows each part's
+  status.
+
+## Tracked bill updates
+
+Tracked bills are re-checked every hour (`BILLTRACKER_REFRESH_HOURS`). When
+one has new actions, you get one email for that bill listing them, with your
+position and its status. Choose which kinds of actions send email under
+Alerts & settings: committee assignments, committee votes, floor action, sent
+to the other chamber, Governor, authors, other.
+
+## Relevant / Not relevant
+
+In a priority's bill list (and on each bill's page), mark each match
+**Relevant** or **Not relevant**. Not-relevant bills drop out of the list and
+the agenda counts but stay under "Marked not relevant". When you edit a
+priority's keywords, the tracker shows which keywords are behind the
+Not-relevant marks, so you know what to narrow.
+
+## Backups
+
+- Every morning the server saves a full copy of the database in
+  `data/backups/` and keeps 14 days.
+- The daily check-in email has a small backup file attached
+  (`onevoice-backup-YYYY-MM-DD.json`) with tracked bills, notes, positions,
+  relevance marks, keyword edits and settings (never passwords or keys).
+  **Download a backup** under Alerts & settings gets the same file any time.
+- To restore from that file on a new server: upload it (SSH window > Upload
+  file), then run
+  `cd ~/onevoice-tracker && .venv/bin/python app.py restore ~/onevoice-backup-YYYY-MM-DD.json`
+  and `sudo systemctl restart onevoice-tracker`.
+
 ## How alerts work
 
 1. **Finding new filings, fast.** Every 10 minutes (`BILLTRACKER_FILINGS_MINUTES`). Oklahoma numbers bills in order (Senate bills from
@@ -131,7 +173,8 @@ account.
 | `BILLTRACKER_ALERT_SESSIONS` | same as above | Sessions whose new filings trigger email, comma separated |
 | `BILLTRACKER_FILINGS_MINUTES` | `10` | How often to look for new filings (`0` = off) |
 | `BILLTRACKER_TEXT_MIN_HITS` | `3` | Keyword mentions needed in the bill text (title matches always count) |
-| `BILLTRACKER_REFRESH_HOURS` | `6` | How often tracked bills are re-checked (`0` = off) |
+| `BILLTRACKER_REFRESH_HOURS` | `1` | How often tracked bills are re-checked (`0` = off) |
+| `BILLTRACKER_CHECKIN_HOUR` | `7` | Hour (Central) of the daily check-in email |
 | `BILLTRACKER_INDEX_HOURS` | `6` | How often the search index is rebuilt (`0` = off) |
 | `BILLTRACKER_PASSWORD` | | Team password for signing in (required on a server) |
 | `ANTHROPIC_API_KEY` | | Optional: AI summaries instead of the free ones (paid) |

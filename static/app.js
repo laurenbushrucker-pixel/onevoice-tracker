@@ -117,8 +117,30 @@ function agendaTags(list) {
   if (!list || !list.length) return "";
   return `<div class="agenda-tags">${list.map((a) => {
     const p = priorityById(a.id);
-    return p ? `<span class="agenda-tag" title="${esc(p.task_force)} #${p.number}: ${esc(p.title)} (matched: ${esc(a.keywords.join(", "))})">${esc(shortLabel(p))}</span>` : "";
+    return p ? `<span class="agenda-tag${a.review === "not_relevant" ? " dismissed" : ""}" title="${esc(p.task_force)} #${p.number}: ${esc(p.title)} (matched: ${esc(a.keywords.join(", "))})${a.review === "not_relevant" ? " (marked not relevant)" : ""}">${esc(shortLabel(p))}</span>` : "";
   }).join("")}</div>`;
+}
+
+function reviewButtons(bill, pid, verdict) {
+  return `<span class="review" data-bill="${esc(bill)}" data-pid="${esc(pid)}">
+    <button type="button" class="rv rv-yes" data-verdict="relevant" aria-pressed="${verdict === "relevant"}">✓ Relevant</button>
+    <button type="button" class="rv rv-no" data-verdict="not_relevant" aria-pressed="${verdict === "not_relevant"}">✕ Not relevant</button></span>`;
+}
+function bindReviews(root, onChange) {
+  root.querySelectorAll(".review .rv").forEach((b) => b.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const box = b.closest(".review"), bill = box.dataset.bill, pid = box.dataset.pid;
+    const verdict = b.getAttribute("aria-pressed") === "true" ? null : b.dataset.verdict;
+    try {
+      await api("/api/review", { method: "POST", body: { session: state.session, bill, priority_id: pid, verdict } });
+      box.querySelectorAll(".rv").forEach((x) => x.setAttribute("aria-pressed", String(x.dataset.verdict === verdict)));
+      [state.find.results, state.tracked].forEach((list) => list.forEach((r) => {
+        if (r.bill === bill) (r.agenda || []).forEach((a) => { if (a.id === pid) a.review = verdict; });
+      }));
+      if (onChange) onChange(bill, pid, verdict);
+      loadAgenda();
+    } catch (err) { toast(err.message, true); }
+  }));
 }
 
 // ------------------------------------------------------------------ boot
@@ -173,7 +195,7 @@ function bindEvents() {
     window.location.href = `/api/export.csv?session=${state.session}`;
   });
   $("#find-form").addEventListener("submit", (e) => { e.preventDefault(); runSearch(true); });
-  ["#find-agenda", "#find-subject", "#find-chamber", "#find-stage", "#find-sort"].forEach((s) => $(s).addEventListener("change", () => {
+  ["#find-agenda", "#find-dismissed", "#find-subject", "#find-chamber", "#find-stage", "#find-sort"].forEach((s) => $(s).addEventListener("change", () => {
     if (location.hash.startsWith("#bills-")) history.replaceState(null, "", "#find");
     $("#find-back").hidden = true;
     runSearch(true);
@@ -188,6 +210,11 @@ function bindEvents() {
   $("#drawer-refresh").addEventListener("click", () => state.drawer && openBill(state.drawer.session, state.drawer.bill, true));
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#drawer").hidden) closeDrawer(); });
   $("#settings-form").addEventListener("submit", saveSettings);
+  $("#checkin-now").addEventListener("click", async () => {
+    $("#checkin-now").disabled = true;
+    try { await api("/api/checkin/send", { method: "POST" }); toast("Check-in sent. Look for it in your inbox."); loadHealth(); }
+    catch (err) { toast(err.message, true); } finally { $("#checkin-now").disabled = false; }
+  });
   $("#s-test").addEventListener("click", testEmail);
   $("#agenda-reset").addEventListener("click", confirmReset);
 }
@@ -218,6 +245,7 @@ function route() {
     $("#find-agenda").value = h.slice(6);
     $("#find-q").value = ""; $("#find-subject").value = ""; $("#find-stage").value = ""; $("#find-chamber").value = "";
     $("#find-sort").value = "newest";
+    $("#find-dismissed").value = "";
     document.querySelectorAll(".view").forEach((v) => (v.hidden = v.id !== "view-find"));
     document.querySelectorAll(".tabs a").forEach((a) => a.setAttribute("aria-current", a.dataset.view === "find" ? "page" : "false"));
     $("#find-back").hidden = false;
@@ -233,7 +261,9 @@ function route() {
 
 // ------------------------------------------------------------------ status
 let lastJobFinished = null;
+let healthTick = 0;
 async function pollStatus() {
+  if (++healthTick % 8 === 0) loadHealth();
   try {
     state.status = await api(`/api/status?session=${state.session}`);
   } catch { return; }
@@ -307,7 +337,7 @@ function renderAgenda() {
   $("#agenda-list").querySelectorAll("[data-edit]").forEach((b) => b.addEventListener("click", () => {
     state.editing = state.editing === b.dataset.edit ? null : b.dataset.edit;
     renderAgenda();
-    if (state.editing) previewKeywords(state.editing);
+    if (state.editing) { previewKeywords(state.editing); loadNoise(state.editing); }
   }));
   if (state.editing) bindEditor(state.editing);
 }
@@ -323,6 +353,7 @@ function priorityCard(p) {
         <span><b>${p.matches}</b> matching bill${p.matches === 1 ? "" : "s"}</span>
         ${p.recent ? `<span class="new"><b>${p.recent}</b> new this week</span>` : ""}
         <span><b>${p.tracked}</b> tracked</span>
+        ${p.dismissed ? `<span class="muted"><b>${p.dismissed}</b> not relevant</span>` : ""}
         ${p.enabled ? "" : "<span>Matching is off</span>"}
       </div>
       <div class="pcard-actions">
@@ -337,9 +368,22 @@ function priorityCard(p) {
           <textarea id="kw-exclude" style="min-height:60px">${esc(p.exclude.join("\n"))}</textarea></label>
         <label class="check" for="kw-enabled"><input type="checkbox" id="kw-enabled" ${p.enabled ? "checked" : ""}> Match bills to this priority</label>
         <div class="kw-preview" id="kw-preview">Counting matches…</div>
+        <div class="kw-noise" id="kw-noise"></div>
         <div class="row-end"><button class="btn btn-sm" type="submit">Save keywords</button></div>
       </form>` : ""}
     </article>`;
+}
+
+async function loadNoise(id) {
+  const el = $("#kw-noise");
+  if (!el) return;
+  try {
+    const rows = (await api(`/api/agenda/${id}/noise`)).filter((r) => r.not_relevant);
+    el.innerHTML = rows.length
+      ? `<b>Keywords behind “Not relevant” marks:</b> ${rows.slice(0, 8).map((r) => `<span class="noise-kw">${esc(r.keyword)} <i>${r.not_relevant}✕${r.relevant ? ` ${r.relevant}✓` : ""}</i></span>`).join(" ")}
+         <div class="hint">A keyword with many ✕ and few ✓ is a good one to remove or narrow.</div>`
+      : `<span class="hint">As you mark bills Relevant or Not relevant, this shows which keywords cause the most noise.</span>`;
+  } catch { el.textContent = ""; }
 }
 
 let previewTimer;
@@ -398,6 +442,15 @@ async function loadSettings() {
   const err = s.last_alert_error ? ` The last attempt failed ${ago(s.last_alert_error.at)}: ${s.last_alert_error.error}. Pending alerts will be retried at the next check.` : "";
   $("#s-last").textContent = last + err;
 
+  $("#s-checkin").checked = s.checkin_enabled;
+  $("#s-checkin-backup").checked = s.checkin_backup;
+  $("#checkin-hour").textContent = s.checkin_hour > 12 ? s.checkin_hour - 12 : s.checkin_hour;
+  $("#s-movement").checked = s.movement_enabled;
+  $("#s-cats").innerHTML = s.action_categories.map((c) => `<label class="check" for="cat-${c.key}"><input type="checkbox" id="cat-${c.key}" data-cat="${c.key}" ${s.movement_categories.includes(c.key) ? "checked" : ""}> ${esc(c.label)}</label>`).join("");
+  const every = s.refresh_hours <= 0 ? null : s.refresh_hours === 1 ? "hour" : s.refresh_hours < 1 ? `${Math.round(s.refresh_hours * 60)} minutes` : `${s.refresh_hours} hours`;
+  $("#movement-hint").textContent = (every ? `Tracked bills are re-checked every ${every}. ` : "Automatic re-checks of tracked bills are turned off on this server. ") +
+    "Each bill that moves gets one email listing its new actions.";
+  loadHealth();
   const watching = state.status ? state.status.alerts_watch : s.alert_sessions.some((x) => x.code === state.session);
   const on = s.alerts_enabled && s.email_configured && s.recipients.length;
   $("#alert-state").className = "alert-state" + (on ? "" : " off");
@@ -407,6 +460,34 @@ async function loadSettings() {
       : `Email alerts <b>off</b>. <a href="#settings">Set up alerts</a>`;
 }
 
+async function loadHealth() {
+  let h;
+  try { h = await api("/api/health"); } catch { return; }
+  state.health = h;
+  const row = (ok, label, text) => `<div class="hrow"><span class="hdot ${ok === null ? "unk" : ok ? "ok" : "bad"}"></span><b>${label}</b><span>${text}</span></div>`;
+  const checksBad = h.problems.some((p) => p.kind === "checks");
+  $("#health").innerHTML = [
+    row(h.checks.every_minutes ? !checksBad : null, "Checking for new bills",
+        h.checks.every_minutes ? `Every ${h.checks.every_minutes} minutes · last successful check ${esc(h.checks.last_ok || "not yet")}` : "Automatic checks are off"),
+    row(h.site.ok === undefined ? null : h.site.ok, "Reading oklegislature.gov",
+        h.site.at ? (h.site.ok ? `Working · checked ${esc(h.site.at)}` : esc(h.site.detail || "Not reading correctly")) : "Not checked yet"),
+    row(!h.email.configured ? false : !h.problems.some((p) => p.kind === "email"), "Email",
+        !h.email.configured ? "Not set up on the server" : h.email.last_error && h.problems.some((p) => p.kind === "email")
+          ? `Failing: ${esc(h.email.last_error)}` : `Working${h.email.last_sent ? ` · last alert ${esc(h.email.last_sent)}` : ""}`),
+    row(h.checkin.at ? !!h.checkin.sent : null, "Daily check-in", h.checkin.at ? `Last sent ${esc(h.checkin.at)}` : `First one goes out at ${h.checkin.hour} a.m. Central`),
+    row(h.backup.at ? true : null, "Backups", h.backup.at ? `Server copy ${esc(h.backup.at)} · 14 days kept` : "First server copy is made with the daily check-in"),
+  ].join("");
+  renderBanner();
+}
+
+function renderBanner() {
+  const h = state.health, b = $("#problem-banner");
+  if (!h || !h.problems.length) { b.hidden = true; return; }
+  b.hidden = false;
+  b.innerHTML = h.problems.map((p) => `<div><b>${esc(p.title)}.</b> ${esc(p.message)}</div>`).join("") +
+    `<div class="banner-fix">${esc(h.problems[0].fix)} <a href="#settings">Details</a></div>`;
+}
+
 async function saveSettings(e) {
   e.preventDefault();
   try {
@@ -414,6 +495,10 @@ async function saveSettings(e) {
       alerts_enabled: $("#s-enabled").checked,
       recipients: $("#s-recipients").value.split(/[\n,;]+/).map((x) => x.trim()).filter(Boolean),
       app_url: $("#s-url").value.trim(),
+      checkin_enabled: $("#s-checkin").checked,
+      checkin_backup: $("#s-checkin-backup").checked,
+      movement_enabled: $("#s-movement").checked,
+      movement_categories: [...document.querySelectorAll("#s-cats [data-cat]")].filter((x) => x.checked).map((x) => x.dataset.cat),
     } });
     toast("Settings saved");
     $("#s-recipients").blur(); $("#s-url").blur();
@@ -532,6 +617,7 @@ async function runSearch(reset) {
   if (reset) state.find = { offset: 0, total: 0, results: [] };
   const p = new URLSearchParams({
     session: state.session, q: $("#find-q").value.trim(), subject: $("#find-subject").value, agenda: $("#find-agenda").value,
+    dismissed: $("#find-dismissed").value,
     chamber: $("#find-chamber").value, stage: $("#find-stage").value, sort: $("#find-sort").value, offset: state.find.offset, limit: 50,
   });
   $("#find-meta").textContent = "Searching…";
@@ -552,6 +638,7 @@ function renderResults() {
   const q = $("#find-q").value.trim();
   $("#find-noindex").hidden = !(noIndex && !results.length);
   const ag = $("#find-agenda").value, p = ag && ag !== "any" ? priorityById(ag) : null;
+  $("#find-dismissed").hidden = !ag;
   $("#find-meta").textContent = results.length
     ? `Showing ${results.length.toLocaleString()} of ${total.toLocaleString()} measures${p ? ` matching ${shortLabel(p)}: ${p.title}` : ag === "any" ? " matching the agenda" : ""}`
     : noIndex ? "" : q ? `No measures match “${q}”.` : "No measures match these filters.";
@@ -565,6 +652,7 @@ function renderResults() {
         <p class="last"><b>Last action:</b> ${esc(r.last_action || "No action recorded")}${r.last_action_date ? " · " + fmtDate(r.last_action_date) : ""}</p>
         ${officialTitle(r)}
         ${agendaTags(r.agenda)}
+        ${p ? (() => { const a = (r.agenda || []).find((x) => x.id === p.id); return a ? `<div class="review-row"><span class="matched-on">Matched on: ${esc(a.keywords.slice(0, 4).join(", "))}</span>${reviewButtons(r.bill, p.id, a.review)}</div>` : ""; })() : ""}
       </div>
       <div class="result-actions">${tracked.has(r.bill)
         ? `<span class="tracked-flag">Tracking</span>`
@@ -576,6 +664,16 @@ function renderResults() {
     if (!(await track(b.dataset.track))) { b.disabled = false; b.textContent = "Track"; }
   }));
   bindSummarize($("#find-results"));
+  bindReviews($("#find-results"), (bill, pid, verdict) => {
+    const view = $("#find-dismissed").value;
+    const gone = (view === "" && verdict === "not_relevant") || (view === "only" && verdict !== "not_relevant");
+    if (gone) {
+      state.find.results = state.find.results.filter((r) => r.bill !== bill);
+      state.find.total = Math.max(0, state.find.total - 1);
+      renderResults();
+      toast(verdict === "not_relevant" ? "Marked not relevant. It’s listed under “Marked not relevant” if you change your mind." : "Moved back to the review list.");
+    }
+  });
   $("#find-results").querySelectorAll(".result-main").forEach((el) => el.addEventListener("click", (e) => { if (!e.target.closest("button")) openBill(state.session, el.dataset.bill); }));
 }
 
@@ -663,7 +761,7 @@ function renderDrawer(d) {
   const authors = [d.author, d.other_author].filter(Boolean).join(" and ");
   const agendaBlock = (d.agenda || []).map((a) => {
     const p = priorityById(a.id);
-    return p ? `<div><b>${esc(p.task_force)} #${p.number}:</b> ${esc(p.title)} <span class="kw">(matched: ${esc(a.keywords.join(", "))})</span></div>` : "";
+    return p ? `<div class="d-agenda-row"><div><b>${esc(p.task_force)} #${p.number}:</b> ${esc(p.title)} <span class="kw">(matched: ${esc(a.keywords.join(", "))})</span></div>${reviewButtons(d.bill, p.id, a.review)}</div>` : "";
   }).join("");
 
   $("#drawer-body").innerHTML = `
@@ -730,6 +828,7 @@ function renderDrawer(d) {
     </div>`;
 
   bindAi(d);
+  bindReviews($("#drawer-body"), (bill, pid, verdict) => { (d.agenda || []).forEach((a) => { if (a.id === pid) a.review = verdict; }); if (currentView() === "find") runSearch(true); });
   if (t) {
     $("#t-position").addEventListener("change", (e) => saveTracking(d.bill, { position: e.target.value }));
     $("#t-priority").addEventListener("change", (e) => saveTracking(d.bill, { priority: e.target.value }));

@@ -36,6 +36,7 @@
 </header>
 
 <div class="wrap">
+  <div class="banner" id="problem-banner" role="alert" hidden></div>
   <div class="statusbar" id="statusbar" role="status" aria-live="polite"></div>
 </div>
 
@@ -97,6 +98,9 @@
       <select id="find-agenda" aria-label="OneVoice priority">
         <option value="">All bills</option><option value="any">Matches any agenda item</option>
       </select>
+      <select id="find-dismissed" aria-label="Which matches" hidden>
+        <option value="">Matches to review and relevant</option><option value="only">Marked not relevant</option><option value="all">All matches</option>
+      </select>
       <select id="find-subject" aria-label="Subject"><option value="">All subjects</option></select>
       <select id="find-chamber" aria-label="Chamber">
         <option value="">Both chambers</option><option value="H">House measures</option><option value="S">Senate measures</option>
@@ -132,6 +136,14 @@
 
   <!-- Settings -->
   <section id="view-settings" class="view" hidden>
+    <div class="panel">
+      <h2>Is everything working?</h2>
+      <div id="health" class="health"></div>
+      <div class="row-end">
+        <button class="btn btn-ghost btn-sm" type="button" id="checkin-now">Send today’s check-in now</button>
+        <a class="btn btn-ghost btn-sm" href="/api/backup.json" id="backup-download">Download a backup</a>
+      </div>
+    </div>
     <form class="panel" id="settings-form">
       <h2>Email alerts for newly filed bills</h2>
       <p class="hint" id="alerts-explainer"></p>
@@ -143,6 +155,18 @@
       <label class="stack" for="s-url">Tracker web address (used for links in the email)
         <input id="s-url" placeholder="https://onevoice-tracker.example.org/">
       </label>
+      <fieldset class="group">
+        <legend>Daily check-in</legend>
+        <label class="check" for="s-checkin"><input type="checkbox" id="s-checkin"> Email a check-in every morning at <span id="checkin-hour">7</span> a.m. Central</label>
+        <label class="check" for="s-checkin-backup"><input type="checkbox" id="s-checkin-backup"> Attach a backup of tracked bills, notes, positions, relevance marks and keyword edits</label>
+        <p class="hint">The check-in lists the last 24 hours of activity. If it doesn’t arrive, the tracker may be down. You’ll also get an email right away if checks stop working, and another when it’s fixed.</p>
+      </fieldset>
+      <fieldset class="group">
+        <legend>When a tracked bill moves</legend>
+        <label class="check" for="s-movement"><input type="checkbox" id="s-movement"> Email me when a bill I track has a new action</label>
+        <div class="cats" id="s-cats"></div>
+        <p class="hint" id="movement-hint"></p>
+      </fieldset>
       <div class="row-end">
         <button class="btn" type="submit">Save settings</button>
         <button class="btn btn-ghost" type="button" id="s-test">Send a test email</button>

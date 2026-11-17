@@ -421,3 +421,38 @@ def session_closed(session: str, today: datetime | None = None) -> bool:
         return today.year > year
     end_year = year if year % 2 == 0 else year + 1
     return (today.year, today.month) > (end_year, 5)
+
+
+# --------------------------------------------------------- action categories
+
+ACTION_CATEGORIES = [
+    ("committee_assignment", "Committee assignments"),
+    ("committee_vote", "Committee votes and reports"),
+    ("floor", "Floor action and votes"),
+    ("other_chamber", "Sent to the other chamber"),
+    ("governor", "Governor (sent, signed, vetoed)"),
+    ("authors", "Authors added or removed"),
+    ("other", "Other actions"),
+]
+DEFAULT_MOVEMENT_CATEGORIES = ["committee_assignment", "committee_vote", "floor", "other_chamber", "governor"]
+
+
+def classify_action(action: str, chamber: str = "", bill: str = "") -> str:
+    """Sort a history line into one of ACTION_CATEGORIES. A first reading in
+    the bill's own chamber is just its introduction ("other")."""
+    t = action.lower()
+    if t.startswith("first reading") and bill and chamber == origin_chamber(bill):
+        return "other"
+    if re.search(r"governor|became law|veto|enrolled|signed, returned|filed with secretary of state", t):
+        return "governor"
+    if re.search(r"\b(co)?authored\b|author (removed|added|changed)|title (stricken|restored)|principal (house|senate) author", t):
+        return "authors"
+    if re.search(r"engrossed.*to (house|senate)|engrossed, signed, to|^first reading", t):
+        return "other_chamber"
+    if re.search(r"do pass|do not pass|reported|\bcr\b|cr filed|committee substitute|failed in committee|recommendation to the", t):
+        return "committee_vote"
+    if re.search(r"referred to|second reading referred|withdrawn from|recommitted|re-?referred", t):
+        return "committee_assignment"
+    if re.search(r"general order|third reading|passed|failed|calendar|considered|amended|ayes|reconsider|conference|ha's|sa's|has (read|adopted)", t):
+        return "floor"
+    return "other"
