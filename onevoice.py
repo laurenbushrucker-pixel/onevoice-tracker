@@ -103,58 +103,78 @@ def send_email(to: list[str], subject: str, text: str, html_body: str) -> None:
         server.quit()
 
 
-def render_alert(items: list[dict], app_url: str, session_name: str) -> tuple[str, str, str]:
-    """items: [{display, title, url, last_action, priorities: [{task_force, number, title, keywords}]}]"""
-    n = len(items)
-    verb = "match" if n != 1 else "matches"
-    subject = f"OneVoice Tracker: {n} new bill{'s' if n != 1 else ''} {verb} the agenda"
+def policy_areas(item: dict) -> list[str]:
+    """Distinct task-force names (the agenda's policy areas) a bill matches, in agenda order."""
+    out: list[str] = []
+    for p in item["priorities"]:
+        if p["task_force"] not in out:
+            out.append(p["task_force"])
+    return out
 
-    lines = [f"{n} newly filed bill{'s' if n != 1 else ''} in the {session_name} match{'' if n != 1 else 'es'} the OneVoice state agenda.", ""]
-    for it in items:
-        lines.append(f"{it['display']}" + (f" (by {it['author']})" if it.get("author") else "") + f": {it['title']}")
-        if it.get("summary"):
-            lines.append(f"  AI summary: {it['summary']}")
-        for p in it["priorities"]:
-            lines.append(f"  - {p['task_force']} #{p['number']}: {p['title']} (matched: {', '.join(p['keywords'])})")
-        lines.append(f"  {it['url']}")
-        lines.append("")
+
+def render_alert(item: dict, app_url: str, session_name: str) -> tuple[str, str, str]:
+    """One email for one newly filed bill.
+
+    item: {display, title, author, summary, url, last_action,
+           priorities: [{task_force, number, title, keywords}]}
+    """
+    areas = policy_areas(item) or ["Agenda"]
+    area_text = " & ".join(areas)
+    subject = f"OneVoice Tracker: New {area_text} Bill Filed"
+    author = item.get("author") or "Not listed yet"
+    summary = item.get("summary") or ""
+    matches = [f"{p['task_force']} #{p['number']}: {p['title']}" for p in item["priorities"]]
+
+    lines = [
+        f"A new bill matching the OneVoice {area_text} agenda was filed in the {session_name}.",
+        "",
+        f"Bill number: {item['display']}",
+        f"Author: {author}",
+        "Subject area: " + ("; ".join(matches) if matches else area_text),
+        "",
+        "What it does (AI summary):",
+        summary or f"No AI summary available. Official title: {item['title']}",
+        "",
+        f"Official title: {item['title']}" if summary else "",
+        f"Read the bill: {item['url']}",
+    ]
     if app_url:
         lines.append(f"Open the tracker: {app_url}#agenda")
-    lines.append("You are getting this because your address is on the OneVoice Tracker alert list.")
-    text = "\n".join(lines)
+    lines += ["", "AI summaries can be wrong; read the bill before taking a position.",
+              "You are getting this because your address is on the OneVoice Tracker alert list."]
+    text = "\n".join(l for l in lines if l is not None)
 
     e = html.escape
-    rows = []
-    for it in items:
-        pr = "".join(
-            f'<div style="margin:4px 0 0;font-size:13px;color:#3d4a3a">'
-            f'<b style="color:#4f8a1e">{e(p["task_force"])} #{p["number"]}</b> &middot; {e(p["title"])}'
-            f'<span style="color:#707a6c"> (matched: {e(", ".join(p["keywords"]))})</span></div>'
-            for p in it["priorities"]
-        )
-        rows.append(
-            f'<tr><td style="padding:14px 0;border-bottom:1px solid #e3e7df">'
-            f'<a href="{e(it["url"])}" style="font:600 15px Menlo,Consolas,monospace;color:#2f3a2c;text-decoration:none">{e(it["display"])}</a>'
-            + (f' <span style="font-size:13px;color:#707a6c">by {e(it["author"])}</span>' if it.get("author") else "")
-            + (f'<div style="font-size:15px;color:#1d241b;margin-top:4px">{e(it["summary"])}</div>'
-               f'<div style="font-size:12px;color:#707a6c;margin-top:2px">AI summary &middot; Official title: {e(it["title"])}</div>'
-               if it.get("summary") else f'<div style="font-size:15px;color:#1d241b;margin-top:2px">{e(it["title"])}</div>')
-            + f'{pr}'
-            + (f'<div style="font-size:12px;color:#707a6c;margin-top:4px">Latest: {e(it["last_action"])}</div>' if it.get("last_action") else "")
-            + "</td></tr>"
-        )
-    button = (
-        f'<p style="margin:20px 0"><a href="{e(app_url)}#agenda" style="background:#5a9a28;color:#fff;padding:10px 16px;'
-        f'border-radius:6px;text-decoration:none;font-weight:600">Open OneVoice Tracker</a></p>' if app_url else ""
+    label = 'style="padding:8px 12px 8px 0;color:#5d6659;font-size:13px;white-space:nowrap;vertical-align:top;width:110px"'
+    value = 'style="padding:8px 0;color:#1d241b;font-size:15px;vertical-align:top"'
+    area_rows = "".join(
+        f'<div><b style="color:#4f8a1e">{e(p["task_force"])} #{p["number"]}</b> &middot; {e(p["title"])}</div>'
+        for p in item["priorities"]
+    ) or e(area_text)
+    summary_html = (
+        f'<div style="font-size:15px;line-height:1.5;color:#1d241b">{e(summary)}</div>'
+        if summary else
+        '<div style="font-size:14px;color:#5d6659;font-style:italic">No AI summary available.</div>'
+    )
+    tracker_button = (
+        f'<a href="{e(app_url)}#agenda" style="display:inline-block;background:#5a9a28;color:#fff;padding:10px 16px;'
+        f'border-radius:6px;text-decoration:none;font-weight:600;margin:0 8px 8px 0">Open OneVoice Tracker</a>' if app_url else ""
     )
     html_body = f"""<!doctype html><html><body style="margin:0;background:#f4f6f2;padding:24px 12px;font-family:Arial,Helvetica,sans-serif">
-<table role="presentation" width="100%" style="max-width:640px;margin:0 auto;background:#fff;border-radius:8px;border-top:6px solid #5a9a28">
+<table role="presentation" width="100%" style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:8px;border-top:6px solid #5a9a28">
 <tr><td style="padding:24px 28px">
 <div style="font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#5a9a28;font-weight:700">OneVoice Tracker</div>
-<h1 style="font-size:20px;color:#1d241b;margin:6px 0 4px">{n} new bill{'s' if n != 1 else ''} {verb} the agenda</h1>
-<p style="color:#4d574a;margin:0 0 8px;font-size:14px">Newly filed in the {e(session_name)}, matched against the OneVoice state priorities.</p>
-<table role="presentation" width="100%" style="border-collapse:collapse">{''.join(rows)}</table>
-{button}
-<p style="color:#8a9386;font-size:12px;margin-top:18px">Matches come from keywords in each bill's title. Review the bill before taking a position. You are getting this because your address is on the OneVoice Tracker alert list.</p>
+<h1 style="font-size:21px;color:#1d241b;margin:6px 0 4px">New {e(area_text)} Bill Filed</h1>
+<p style="color:#4d574a;margin:0 0 14px;font-size:14px">Filed in the {e(session_name)}.</p>
+<table role="presentation" width="100%" style="border-collapse:collapse;border-top:1px solid #e3e7df;border-bottom:1px solid #e3e7df">
+<tr><td {label}>Bill number</td><td {value}><a href="{e(item['url'])}" style="font:700 16px Menlo,Consolas,monospace;color:#2f3a2c;text-decoration:none">{e(item['display'])}</a></td></tr>
+<tr><td {label}>Author</td><td {value}>{e(author)}</td></tr>
+<tr><td {label}>Subject area</td><td {value}>{area_rows}</td></tr>
+</table>
+<h2 style="font-size:13px;letter-spacing:.06em;text-transform:uppercase;color:#5d6659;margin:18px 0 6px">What it does &middot; AI summary</h2>
+{summary_html}
+<p style="font-size:12px;color:#707a6c;margin:10px 0 18px">Official title: {e(item['title'])}</p>
+<div>{tracker_button}<a href="{e(item['url'])}" style="display:inline-block;border:1px solid #c9d1c2;color:#2f3a2c;padding:9px 15px;border-radius:6px;text-decoration:none;font-weight:600;margin:0 0 8px">Read the bill</a></div>
+<p style="color:#8a9386;font-size:12px;margin-top:18px">AI summaries can be wrong; read the bill before taking a position. You are getting this because your address is on the OneVoice Tracker alert list.</p>
 </td></tr></table></body></html>"""
     return subject, text, html_body

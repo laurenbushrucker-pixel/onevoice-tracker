@@ -237,7 +237,7 @@ def session_name(code: str) -> str:
 
 
 def send_alerts() -> dict:
-    """Email one digest of every pending agenda match. Returns a summary."""
+    """Email each newly matched bill (one email per bill). Returns a summary."""
     st = settings()
     with db() as c:
         rows = c.execute(
@@ -268,16 +268,18 @@ def send_alerts() -> dict:
                                        "keywords": json.loads(r["keywords"])})
     sent = 0
     for session, bills in by_session.items():
-        subject, text, html_body = ov.render_alert(list(bills.values()), st["app_url"], session_name(session))
-        try:
-            ov.send_email(st["recipients"], subject, text, html_body)
-        except Exception as e:  # noqa: BLE001 - keep pending and report; retried next check
-            meta_set("last_alert_error", {"at": now_iso(), "error": str(e)})
-            return {"sent": sent, "error": str(e)}
-        with db() as c:
-            c.execute("UPDATE matches SET alert='sent', alerted_at=? WHERE alert='pending' AND session=?", (now_iso(), session))
-        sent += len(bills)
-        meta_set("last_alert", {"at": now_iso(), "bills": len(bills), "session": session})
+        for bill, item in bills.items():  # one email per bill, titled with its policy area
+            subject, text, html_body = ov.render_alert(item, st["app_url"], session_name(session))
+            try:
+                ov.send_email(st["recipients"], subject, text, html_body)
+            except Exception as e:  # noqa: BLE001 - keep pending and report; retried next check
+                meta_set("last_alert_error", {"at": now_iso(), "error": str(e)})
+                return {"sent": sent, "error": str(e)}
+            with db() as c:
+                c.execute("UPDATE matches SET alert='sent', alerted_at=? WHERE alert='pending' AND session=? AND bill=?",
+                          (now_iso(), session, bill))
+            sent += 1
+            meta_set("last_alert", {"at": now_iso(), "bills": sent, "session": session})
     meta_set("last_alert_error", None)
     return {"sent": sent}
 
@@ -1161,12 +1163,14 @@ def api_settings_update():
 @app.post("/api/settings/test-email")
 def api_test_email():
     st = settings()
-    sample = [{
-        "display": "HB 0000", "title": "Example only: this is what an alert looks like. No bill was filed.",
+    sample = {
+        "display": "HB 0000", "author": "Example Author (H)",
+        "title": "Schools; example title for a test alert; effective date.",
+        "summary": "Example only: no bill was filed. A real alert shows a 2-3 sentence AI summary here describing what the bill would do and who it affects.",
         "url": ok.BASE, "last_action": "",
         "priorities": [{"task_force": "Workforce and Talent Strategies", "number": 1,
-                        "title": "Strengthen Public Education and Early Literacy", "keywords": ["literacy"]}],
-    }]
+                        "title": "Strengthen Public Education and Early Literacy", "keywords": ["schools"]}],
+    }
     subject, text, html_body = ov.render_alert(sample, st["app_url"], session_name(DEFAULT_SESSION))
     try:
         ov.send_email(st["recipients"], "[Test] " + subject, text, html_body)
