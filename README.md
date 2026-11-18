@@ -154,6 +154,17 @@ Donors and PAC activities are logged under Goals › Donors & activities.
 Targets can be edited, and "Download (Excel)" exports the scorecard and all
 logs. Set `BILLTRACKER_GOAL_YEAR` to change the default year (2027).
 
+## Legislator directory
+
+The Legislators screen lists all 149 House and Senate members from okhouse.gov
+and oksenate.gov (refreshed weekly, or with the Refresh button): photo, party,
+district, hometown, email or contact form, office, phone, assistant, committees,
+and the counties and towns in their district. Filter to Tulsa County or the
+seven-county Tulsa region. Each profile shows the OneVoice and tracked bills
+they authored (taken from the author links on oklegislature.gov), their
+upcoming committee meetings, and every meeting your team logged with them, with
+a button to log a new one. Author names on a bill's page link to the profile.
+
 ## Staying reliable
 
 - **Daily check-in** (7 a.m. Central, `BILLTRACKER_CHECKIN_HOUR`): an email

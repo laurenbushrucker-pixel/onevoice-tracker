@@ -42,6 +42,7 @@
     <a href="#find" data-view="find">Bill Search</a>
     <a href="#mine" data-view="mine">My Bills <span class="count" id="count-mine"></span></a>
     <a href="#agenda" data-view="agenda">Agenda</a>
+    <a href="#directory" data-view="directory">Legislators</a>
     <a href="#scoreboard" data-view="scoreboard">Scoreboard</a>
     <a href="#goals" data-view="goals">Goals</a>
     <a href="#meetings" data-view="meetings">Meetings</a>
@@ -67,6 +68,7 @@
       <a class="tile" href="#press"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 5h13v14H6a2 2 0 0 1-2-2z M17 9h3v8a2 2 0 0 1-2 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M7 9h7M7 13h7M7 16h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Press Releases</b><span class="tile-sub" id="tile-press">Senate, House, Governor, agencies</span></a>
       <a class="tile" href="#mine"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></span><b>My Bills</b><span class="tile-sub" id="tile-mine">Bills with a Chamber position</span></a>
       <a class="tile" href="#agenda"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14M5 12h14M5 19h9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>OneVoice Agenda</b><span class="tile-sub">The 21 state priorities</span></a>
+      <a class="tile" href="#directory"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 21h18M5 21V10M9.5 21V10M14.5 21V10M19 21V10M2.5 10L12 4l9.5 6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg></span><b>Legislators</b><span class="tile-sub">Directory, their bills, our meetings</span></a>
       <a class="tile" href="#scoreboard"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Scoreboard</b><span class="tile-sub" id="tile-score">How the session is going</span></a>
       <a class="tile" href="#goals"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/></svg></span><b>2027 Goals</b><span class="tile-sub" id="tile-goals">Government Affairs scorecard</span></a>
       <a class="tile" href="#meetings"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="16" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M2.5 19c.6-3 2.8-5 5.5-5s4.9 2 5.5 5M13.5 14.3c.8-.2 1.6-.3 2.5-.3 2.7 0 4.9 2 5.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Meetings</b><span class="tile-sub" id="tile-meetings">Who we met and what we discussed</span></a>
@@ -109,6 +111,23 @@
     <p class="hint" id="press-meta"></p>
     <ol class="press-list" id="press-list"></ol>
     <div class="center"><button class="btn btn-ghost" id="press-more" type="button" hidden>Show more</button></div>
+  </section>
+
+  <!-- Legislator directory -->
+  <section id="view-directory" class="view" hidden>
+    <div id="dir-list-wrap">
+      <div class="page-head"><div><h2>Legislators</h2><p class="hint" id="dir-meta">All 149 members of the House and Senate.</p></div>
+        <button class="btn btn-ghost btn-sm" type="button" id="dir-refresh">Refresh from House &amp; Senate sites</button></div>
+      <div class="toolbar">
+        <input type="search" id="dir-q" placeholder="Search by name, town, county or committee" aria-label="Search legislators">
+        <select id="dir-chamber" aria-label="Chamber"><option value="">House and Senate</option><option>House</option><option>Senate</option></select>
+        <select id="dir-area" aria-label="Area"><option value="">All of Oklahoma</option><option value="tulsa">Tulsa County</option><option value="region">Tulsa region (7 counties)</option></select>
+        <select id="dir-party" aria-label="Party"><option value="">Any party</option><option>Republican</option><option>Democratic</option></select>
+        <select id="dir-sort" aria-label="Sort"><option value="name">Sort by name</option><option value="onevoice">Most OneVoice bills</option><option value="meetings">Most meetings with us</option><option value="district">District number</option></select>
+      </div>
+      <ol class="leg-list" id="dir-list"></ol>
+    </div>
+    <div id="dir-profile" hidden></div>
   </section>
 
   <!-- Session scoreboard -->
@@ -168,7 +187,7 @@
   <section id="view-more" class="view" hidden>
     <nav class="more-list" aria-label="More">
       <a href="#find">Bill Search</a><a href="#mine">My Bills</a><a href="#agenda">OneVoice Agenda</a>
-      <a href="#scoreboard">Session Scoreboard</a><a href="#goals">2027 Goals</a><a href="#meetings">Meetings log</a><a href="#report">Friday Report for Members</a>
+      <a href="#directory">Legislator directory</a><a href="#scoreboard">Session Scoreboard</a><a href="#goals">2027 Goals</a><a href="#meetings">Meetings log</a><a href="#report">Friday Report for Members</a>
       <a href="#updates">Updates on tracked bills</a><a href="#settings">Alerts &amp; Settings</a>
     </nav>
     <div class="panel">

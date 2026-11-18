@@ -247,3 +247,99 @@ def fetch_press(src: dict) -> list[dict]:
     if src["kind"] == "house_next":
         return house_press()
     return aem_newsroom(src["url"], src["name"])
+
+
+# ------------------------------------------------------ legislator directory
+
+def _next_data(url: str) -> dict:
+    s = _get(url).text
+    m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', s, re.S)
+    if not m:
+        raise RuntimeError(f"No page data on {url}")
+    return json.loads(m.group(1)).get("props", {}).get("pageProps", {})
+
+
+def _attrs(o):
+    o = (o or {}).get("data", o) if isinstance(o, dict) else o
+    if isinstance(o, list):
+        o = o[0] if o else {}
+    return (o or {}).get("attributes", o or {})
+
+
+def _html_list(fragment: str, heading: str) -> list[str]:
+    """Items under a bold heading in the House's district info, e.g. 'County(s) Represented'."""
+    m = re.search(rf"{heading}.*?</p>\s*<p>(.*?)</p>", fragment or "", re.S | re.I)
+    return [x.strip() for x in _text(m.group(1)).split(",") if x.strip()] if m else []
+
+
+def house_members() -> list[dict]:
+    pp = _next_data("https://www.okhouse.gov/representatives")
+    out = []
+    for m in pp.get("members", {}).get("legislatureMembers", []):
+        a = m.get("attributes", {})
+        lead = [_attrs(_attrs(x).get("labelRole")).get("name", "") for x in (a.get("leaderships") or {}).get("data", [])]
+        out.append({"slug": a.get("slug"), "leadership": ", ".join(x for x in lead if x)})
+    return [x for x in out if x["slug"]]
+
+
+def house_member(slug: str) -> dict:
+    a = _attrs(_next_data(f"https://www.okhouse.gov/representatives/{slug}").get("memberData"))
+    dist = _attrs(a.get("district"))
+    office = a.get("capitolOffice") or {}
+    contact = a.get("contact") or {}
+    stats = {s.get("label"): s.get("metric") for s in a.get("stats") or []}
+    portrait = _attrs(a.get("portrait"))
+    fmts = portrait.get("formats") or {}
+    photo = (fmts.get("small") or fmts.get("thumbnail") or {}).get("url") or portrait.get("url") or ""
+    return {
+        "chamber": "House", "slug": slug, "first": a.get("firstName") or "", "last": a.get("lastName") or "",
+        "name": a.get("name") or f"{a.get('firstName', '')} {a.get('lastName', '')}".strip(),
+        "district": dist.get("number"), "party": _attrs(a.get("party")).get("name", ""),
+        "photo": photo, "email": contact.get("value", "") if (contact.get("method") or "").lower() == "email" else "",
+        "contact_url": "", "phone": office.get("phone") or "",
+        "office": ", ".join(x for x in (office.get("address"), office.get("address2")) if x),
+        "assistant": (a.get("legislativeAssistant") or {}).get("fullName") or "",
+        "hometown": stats.get("Hometown", ""), "term_limited": stats.get("Term Limited", ""),
+        "committees": [c["attributes"]["name"] for c in a.get("committees") or [] if c.get("attributes", {}).get("name")],
+        "counties": _html_list(dist.get("info"), "County"), "cities": _html_list(dist.get("info"), "Municipalit"),
+        "zips": _html_list(dist.get("info"), "Zip"),
+        "page_url": f"https://www.okhouse.gov/representatives/{slug}",
+    }
+
+
+def senate_members() -> list[dict]:
+    s = _get("https://oksenate.gov/senators").text
+    out = []
+    for slug, body in re.findall(r'<a class="sSen__sLink" href="/senators/([^"]+)">(.*?)</a>', s, re.S):
+        if "vacant" in slug.lower():
+            continue
+        out.append({"slug": slug, "leadership": _text((re.search(r'sSen__sName-committee-info">(.*?)</span>', body, re.S) or [None, ""])[1])})
+    return out
+
+
+def senate_member(slug: str) -> dict:
+    s = _get(f"https://oksenate.gov/senators/{slug}").text
+    body = s[s.find('id="main-content"'):]
+    def info(label):
+        m = re.search(rf"<strong>{label}:</strong>(.*?)</div>", body, re.S)
+        return _text(m.group(1)) if m else ""
+    name = _text((re.search(r'field--name-title[^>]*>(.*?)</span>', body, re.S) or [None, ""])[1])
+    photo = (re.search(r"bSenBio__img\"\s+style=\"background-image:\s*url\('([^']+)'", body) or [None, ""])[1]
+    dist = (re.search(r"<h2>\s*District\s+(\d+)", body) or [None, None])[1]
+    tds = re.findall(r'<div class="bDistrict__td">(.*?)</div>', body, re.S)
+    lists = [[_text(x) for x in re.findall(r"<li>(.*?)</li>", td, re.S)] for td in tds]
+    contact = (re.search(r'href="(/contact-senator\?sid=\d+)"', body) or [None, ""])[1]
+    parts = name.split()
+    return {
+        "chamber": "Senate", "slug": slug, "first": " ".join(parts[:-1]), "last": parts[-1] if parts else "", "name": name,
+        "district": int(dist) if dist else None, "party": info("Party"),
+        "photo": urljoin("https://oksenate.gov", photo) if photo else "", "email": "",
+        "contact_url": urljoin("https://oksenate.gov", contact) if contact else "",
+        "phone": _text((re.search(r'bSenBio__tel">(.*?)</div>', body, re.S) or [None, ""])[1]),
+        "office": _text((re.search(r'bSenBio__address">(.*?)</div>', body, re.S) or [None, ""])[1]),
+        "assistant": _text((re.search(r'bSenBio__assistant">(.*?)</div>', body, re.S) or [None, ""])[1]),
+        "hometown": info("Hometown"), "term_limited": "",
+        "committees": [_text(x) for x in re.findall(r'class="bMembership__item"[^>]*>(.*?)</a>', body, re.S)],
+        "counties": lists[0] if lists else [], "cities": [], "zips": lists[1] if len(lists) > 1 else [],
+        "page_url": f"https://oksenate.gov/senators/{slug}",
+    }

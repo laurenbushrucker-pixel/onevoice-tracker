@@ -155,6 +155,10 @@ CREATE TABLE IF NOT EXISTS redlines (
   id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, bill TEXT NOT NULL,
   old_version TEXT, old_url TEXT, new_version TEXT, new_url TEXT, old_body BLOB,
   headline TEXT, diff TEXT, keywords TEXT DEFAULT '{}', at TEXT NOT NULL, emailed INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS legislators (
+  key TEXT PRIMARY KEY, chamber TEXT, slug TEXT, first TEXT, last TEXT, name TEXT, district INTEGER, party TEXT, photo TEXT,
+  email TEXT, contact_url TEXT, phone TEXT, office TEXT, assistant TEXT, hometown TEXT, term_limited TEXT, leadership TEXT,
+  page_url TEXT, committees TEXT DEFAULT '[]', counties TEXT DEFAULT '[]', cities TEXT DEFAULT '[]', zips TEXT DEFAULT '[]', updated_at TEXT);
 CREATE TABLE IF NOT EXISTS goal_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, date TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}',
   created_at TEXT NOT NULL, updated_at TEXT);
@@ -935,10 +939,14 @@ def scheduler() -> None:
                 elif _due("last_auto_refresh", REFRESH_HOURS):
                     if start_job("refresh", None, lambda p: refresh_tracked(None, p)):
                         meta_set("last_auto_refresh", now_iso())
+                elif _due("legislators", 24 * 7):
+                    start_job("legislators", None, refresh_legislators)
                 elif _due(f"indexed:{DEFAULT_SESSION}", INDEX_HOURS):
                     start_job("index", DEFAULT_SESSION, lambda p: build_index(DEFAULT_SESSION, p))
                 elif _due(f"summaries:{DEFAULT_SESSION}", 0.25) and summary_candidates(DEFAULT_SESSION, 1):
                     start_job("summaries", DEFAULT_SESSION, lambda p: summarize_pending(DEFAULT_SESSION, p))
+                elif _due(f"ovdetails:{DEFAULT_SESSION}", 0.25) and onevoice_details_missing(DEFAULT_SESSION):
+                    start_job("details", DEFAULT_SESSION, lambda p: fill_onevoice_details(DEFAULT_SESSION, p))
                 elif _due(f"texts:{DEFAULT_SESSION}", 0.1) and texts_missing(DEFAULT_SESSION):
                     start_job("texts", DEFAULT_SESSION, lambda p: fetch_texts(DEFAULT_SESSION, p))
         except Exception:  # noqa: BLE001 - keep the scheduler alive
@@ -1947,6 +1955,7 @@ def api_bill(session, bill):
         subjects=json.loads(b["subjects"]) if b else [],
         agenda=agenda_for(session, [bill]).get(bill, []),
         author_text=author_text(d.get("author", ""), d.get("other_author", "")),
+        author_key=slug_from_url(d.get("author_url")), other_author_key=slug_from_url(d.get("other_author_url")),
         progress=ok.progress(bill, d.get("actions", []), closed=ok.session_closed(session)),
         ai=get_summary(session, bill),
         ai_available=True,
@@ -3496,6 +3505,190 @@ def api_goals_export():
     y = want_year()
     return Response(goals_xlsx(y), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     headers={"Content-Disposition": f"attachment; filename=Government_Affairs_Goals_{y}.xlsx"})
+
+
+# --------------------------------------------------------- legislator directory
+
+TULSA_REGION = ["Tulsa", "Rogers", "Wagoner", "Osage", "Creek", "Okmulgee", "Pawnee"]
+LEG_FIELDS = ("chamber", "slug", "first", "last", "name", "district", "party", "photo", "email", "contact_url", "phone", "office",
+              "assistant", "hometown", "term_limited", "leadership", "page_url")
+
+
+def refresh_legislators(progress=None) -> dict:
+    """Read every member's page on okhouse.gov and oksenate.gov (contact, committees, district)."""
+    roster = [("House", m) for m in so.house_members()] + [("Senate", m) for m in so.senate_members()]
+    if len(roster) < 100:
+        raise RuntimeError(f"Only {len(roster)} members found; the House or Senate site may have changed.")
+    seen, failed = [], 0
+    for i, (chamber, m) in enumerate(roster, 1):
+        if progress:
+            progress(i, len(roster), m["slug"])
+        try:
+            d = (so.house_member if chamber == "House" else so.senate_member)(m["slug"])
+        except Exception:  # noqa: BLE001 - keep the saved copy of that member
+            failed += 1
+            seen.append(f"{chamber[0]}:{m['slug'].lower()}")
+            continue
+        d["leadership"] = m.get("leadership", "")
+        key = f"{chamber[0]}:{m['slug'].lower()}"
+        seen.append(key)
+        with db() as c:
+            c.execute(f"""INSERT OR REPLACE INTO legislators(key,{','.join(LEG_FIELDS)},committees,counties,cities,zips,updated_at)
+                          VALUES(?,{','.join('?' * len(LEG_FIELDS))},?,?,?,?,?)""",
+                      [key] + [d.get(f) for f in LEG_FIELDS] +
+                      [json.dumps(d.get(k, [])) for k in ("committees", "counties", "cities", "zips")] + [now_iso()])
+    with db() as c:  # members who left office
+        c.execute(f"DELETE FROM legislators WHERE key NOT IN ({','.join('?' * len(seen))})", seen)
+    meta_set("legislators", {"at": now_iso(), "count": len(seen), "failed": failed})
+    return {"members": len(seen), "failed": failed}
+
+
+def slug_from_url(url: str) -> str | None:
+    """'https://www.okhouse.gov/representatives/Jacob-rosecrants' -> 'H:jacob-rosecrants'."""
+    m = re.search(r"(okhouse\.gov/representatives|oksenate\.gov/senators)/([^/?#]+)", url or "", re.I)
+    if not m:
+        return None
+    return ("H:" if "okhouse" in m.group(1).lower() else "S:") + m.group(2).lower()
+
+
+def authored_bills(session: str) -> dict[str, list[tuple[str, str]]]:
+    """{legislator key: [(bill, 'primary'|'principal')]} from saved bill pages."""
+    out: dict[str, list[tuple[str, str]]] = {}
+    with db() as c:
+        rows = c.execute("SELECT bill, data FROM details WHERE session=?", (session,)).fetchall()
+    for r in rows:
+        try:
+            d = json.loads(r["data"])
+        except ValueError:
+            continue
+        for field, role in (("author_url", "primary"), ("other_author_url", "principal")):
+            k = slug_from_url(d.get(field))
+            if k:
+                out.setdefault(k, []).append((r["bill"], role))
+    return out
+
+
+def _norm(s: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower().replace("&", " and ")).strip()
+
+
+def meetings_with(leg: dict, entries: list[dict]) -> list[dict]:
+    """Logged meetings that name this legislator."""
+    last, first = _norm(leg["last"]), _norm(leg["first"]).split(" ")[0] if leg["first"] else ""
+    title = "rep" if leg["chamber"] == "House" else "sen"
+    hits = []
+    for e in entries:
+        for line in people_of(e):
+            n = _norm(line)
+            if re.search(rf"\b{re.escape(last)}\b", n) and ((first and re.search(rf"\b{re.escape(first)}\b", n)) or re.match(rf"{title}\b", n)):
+                hits.append(e)
+                break
+    return hits
+
+
+def legislator_rows() -> list[dict]:
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM legislators ORDER BY last, first")]
+    for r in rows:
+        for k in ("committees", "counties", "cities", "zips"):
+            r[k] = json.loads(r[k] or "[]")
+    return rows
+
+
+def legislator_counts(session: str, rows: list[dict]) -> None:
+    ovb = onevoice_bills(session)
+    auth = authored_bills(session)
+    meetings = goal_log_all("meeting")
+    for r in rows:
+        mine = auth.get(r["key"], [])
+        r["bills_count"] = len(mine)
+        r["onevoice_count"] = sum(1 for b, _ in mine if b in ovb)
+        r["meetings_count"] = len(meetings_with(r, meetings))
+        r["tulsa"] = "Tulsa" in r["counties"]
+        r["region"] = any(x in TULSA_REGION for x in r["counties"])
+
+
+def goal_log_all(kind: str) -> list[dict]:
+    with db() as c:
+        rows = c.execute("SELECT * FROM goal_log WHERE kind=? ORDER BY date DESC, id DESC", (kind,)).fetchall()
+    return [{"id": r["id"], "kind": r["kind"], "date": r["date"], **json.loads(r["data"] or "{}")} for r in rows]
+
+
+@app.get("/api/legislators")
+def api_legislators():
+    s = want_session()
+    rows = legislator_rows()
+    legislator_counts(s, rows)
+    for r in rows:
+        r.pop("zips", None)
+    return jsonify(members=rows, updated=(meta_get("legislators") or {}).get("at"), region=TULSA_REGION)
+
+
+@app.get("/api/legislators/<chamber>/<slug>")
+def api_legislator(chamber, slug):
+    s = want_session()
+    key = f"{chamber[:1].upper()}:{slug.lower()}"
+    rows = [r for r in legislator_rows() if r["key"] == key]
+    if not rows:
+        abort(404, "That legislator isn't in the directory. Refresh the directory from the Legislators screen.")
+    leg = rows[0]
+    ovb = onevoice_bills(s)
+    pri = {p["id"]: p for p in get_priorities()}
+    mine = authored_bills(s).get(key, [])
+    with db() as c:
+        info = {r["bill"]: dict(r) for r in c.execute(
+            "SELECT b.bill, b.title, b.stage, b.last_action_date, t.position FROM bills b LEFT JOIN tracked t ON t.session=b.session AND t.bill=b.bill WHERE b.session=?", (s,))}
+        upcoming = [dict(r) for r in c.execute("SELECT key, chamber, committee, start, time_text, location, agenda_url, bills FROM meetings WHERE start>=? ORDER BY start",
+                                                (datetime.now(CENTRAL).replace(tzinfo=None).isoformat(),))]
+    bills = []
+    for b, role in mine:
+        i = info.get(b, {})
+        bills.append({"bill": b, "display": ok.display_bill(b), "role": role, "title": i.get("title") or "",
+                      "stage_label": ok.STAGE_LABEL.get(i.get("stage") or "unknown", ""), "position": i.get("position"),
+                      "onevoice": [f"{TF_SHORT_PY.get(pri[x]['task_force'], pri[x]['task_force'])} #{pri[x]['number']}" for x in ovb.get(b, []) if x in pri]})
+    bills.sort(key=lambda x: (not x["onevoice"], x["role"] != "primary", x["bill"]))
+    comms = {_norm(x) for x in leg["committees"]}
+    hearings = [m for m in upcoming if m["chamber"] == leg["chamber"] and _norm(m["committee"]) in comms][:10]
+    for m in hearings:
+        m["bills"] = [ok.display_bill(b) for b in json.loads(m["bills"] or "[]")]
+    meets = meetings_with(leg, goal_log_all("meeting"))
+    for e in meets:
+        e["bills_display"] = [ok.display_bill(b) for b in e.get("bills", [])]
+    return jsonify(**leg, bills=bills, meetings=meets, hearings=hearings, onevoice_count=sum(1 for b in bills if b["onevoice"]))
+
+
+@app.post("/api/legislators/refresh")
+def api_legislators_refresh():
+    if not start_job("legislators", None, refresh_legislators):
+        return jsonify(error="Another update is running. Try again in a minute."), 409
+    return jsonify(ok=True)
+
+
+TF_SHORT_PY = {"Energy and Natural Resources": "Energy", "General Government and Legal Reform": "Gov't",
+               "Health and Human Services": "Health", "Economic Development": "Econ Dev", "Tourism and Quality of Life": "Tourism",
+               "Transportation, Infrastructure and Aerospace": "Transport", "Workforce and Talent Strategies": "Workforce"}
+
+
+def fill_onevoice_details(session: str, progress=None, limit: int = 60) -> dict:
+    """Read the bill page (authors, history) of OneVoice bills not read yet, so the directory knows who wrote them."""
+    with db() as c:
+        have = {r["bill"] for r in c.execute("SELECT bill FROM details WHERE session=?", (session,))}
+    todo = [b for b in sorted(onevoice_bills(session)) if b not in have][:limit]
+    for i, b in enumerate(todo, 1):
+        if progress:
+            progress(i, len(todo), ok.display_bill(b))
+        try:
+            get_detail(session, b)
+        except RuntimeError:
+            continue
+    meta_set(f"ovdetails:{session}", {"at": now_iso(), "fetched": len(todo)})
+    return {"fetched": len(todo)}
+
+
+def onevoice_details_missing(session: str) -> int:
+    with db() as c:
+        have = {r["bill"] for r in c.execute("SELECT bill FROM details WHERE session=?", (session,))}
+    return sum(1 for b in onevoice_bills(session) if b not in have)
 
 
 # --------------------------------------------------------------------- main

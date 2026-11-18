@@ -16,7 +16,7 @@ const state = {
   drawer: null, // { session, bill, data }
   editing: null, // priority id whose keywords are open
 };
-const VIEWS = ["home", "newbills", "calendar", "press", "agenda", "mine", "find", "updates", "settings", "more", "scoreboard", "goals", "meetings", "report"];
+const VIEWS = ["home", "newbills", "calendar", "press", "agenda", "mine", "find", "updates", "settings", "more", "scoreboard", "goals", "meetings", "report", "directory"];
 const STAGE_ORDER = ["introduced", "committee", "floor", "crossed", "passed", "governor", "law"];
 const PROGRESS_LABELS = ["Filed", "Committee", "Floor", "2nd chamber", "Passed", "Governor", "Enacted"];
 const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
@@ -546,9 +546,11 @@ function currentView() {
   const h = location.hash.replace("#", "");
   if (h.startsWith("bills-")) return "find";
   if (h.startsWith("bill-")) return "newbills";
+  if (h.startsWith("legislator-")) return "directory";
   return VIEWS.includes(h) ? h : "home";
 }
 function route() {
+  hideTip();
   const view = currentView();
   const h = location.hash.replace("#", "");
   if (h.startsWith("bills-") && priorityById(h.slice(6))) {
@@ -576,8 +578,9 @@ function route() {
   if (view === "goals") loadGoals();
   if (view === "meetings") loadMeetings();
   if (view === "report") loadReport();
+  if (view === "directory") { const h2 = location.hash.replace("#", ""); h2.startsWith("legislator-") ? openLegislator(h2.slice(11)) : showDirectory(); }
   document.querySelectorAll(".bottom-nav a").forEach((a) => a.setAttribute("aria-current",
-    a.dataset.view === view || (a.dataset.view === "more" && ["find", "mine", "agenda", "updates", "settings", "more", "scoreboard", "goals", "meetings", "report"].includes(view)) ? "page" : "false"));
+    a.dataset.view === view || (a.dataset.view === "more" && ["find", "mine", "agenda", "updates", "settings", "more", "scoreboard", "goals", "meetings", "report", "directory"].includes(view)) ? "page" : "false"));
   window.scrollTo(0, 0);
 }
 
@@ -616,7 +619,8 @@ async function pollStatus() {
       if (currentView() === "find") runSearch(true);
       if (currentView() === "newbills") runNewBills(true);
       if (currentView() === "report") loadReport();
-      let msg = { report: "This week’s report dates are up to date", index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
+      if (job.kind === "legislators" && currentView() === "directory") { DIR.rows = null; showDirectory(); }
+      let msg = { legislators: "Legislator directory updated", details: "Bill authors updated", report: "This week’s report dates are up to date", index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
         texts: "Bill texts updated", calendar: "Calendar updated", press: "Press releases updated",
         summaries: job.result ? `Updated ${job.result.summarized} summar${job.result.summarized === 1 ? "y" : "ies"}` : "Summaries updated" }[job.kind];
       if (job.kind === "filings" && job.result) {
@@ -1173,6 +1177,8 @@ function renderDrawer(d) {
 
   const groups = {};
   d.documents.forEach((doc) => (groups[doc.group] = groups[doc.group] || []).push(doc));
+  const authorLink = (name, key) => !name ? "" : key ? `<a href="#legislator-${esc(key.replace(":", "-"))}">${esc(name)}</a>` : esc(name);
+  const authorsHtml = [authorLink(d.author, d.author_key), authorLink(d.other_author, d.other_author_key)].filter(Boolean).join(" and ");
   const authors = [d.author, d.other_author].filter(Boolean).join(" and ");
   const agendaBlock = (d.agenda || []).map((a) => {
     const p = priorityById(a.id);
@@ -1184,7 +1190,7 @@ function renderDrawer(d) {
       <span class="billno">${esc(d.display)}</span> ${stagePill(d.stage, d.stage_label, closed)}
       <h2>${esc(d.title || "Title not yet available")}</h2>
       <div class="d-meta">
-        ${authors ? `<span>By ${esc(authors)}</span>` : ""}
+        ${authors ? `<span>By ${authorsHtml}</span>` : ""}
         ${d.coauthors.length ? `<span>Coauthors: ${esc(d.coauthors.join(", "))}</span>` : ""}
         ${d.subjects.length ? `<span>Subjects: ${esc(d.subjects.join(", "))}</span>` : ""}
         <span>Fetched ${ago(d.fetched_at)}${d.stale ? " (site unreachable, showing saved copy)" : ""}</span>
@@ -1286,6 +1292,7 @@ let tipEl;
 function tip(e, html) {
   if (!tipEl) { tipEl = document.createElement("div"); tipEl.className = "chart-tip"; tipEl.setAttribute("role", "tooltip"); document.body.appendChild(tipEl); }
   if (!html) { tipEl.hidden = true; return; }
+  clearTimeout(tipTimer);
   tipEl.innerHTML = html; tipEl.hidden = false;
   const r = tipEl.getBoundingClientRect();
   let x = e.clientX + 14, y = e.clientY + 14;
@@ -1293,12 +1300,25 @@ function tip(e, html) {
   if (y + r.height > window.innerHeight - 8) y = e.clientY - r.height - 14;
   tipEl.style.left = `${Math.max(8, x)}px`; tipEl.style.top = `${Math.max(8, y)}px`;
 }
+// Tooltips follow a mouse, or keyboard focus. On a phone a tap shows the tip for a
+// moment and any scroll, tap or screen change hides it, so it can never get stuck.
+let tipTimer;
+function hideTip() { clearTimeout(tipTimer); if (tipEl) tipEl.hidden = true; }
+["scroll", "hashchange", "resize"].forEach((ev) => window.addEventListener(ev, hideTip, { passive: true }));
+document.addEventListener("pointerdown", (e) => { if (!e.target.closest || !e.target.closest("[data-tip]")) hideTip(); }, { passive: true });
 function bindTips(root) {
   root.querySelectorAll("[data-tip]").forEach((el) => {
-    el.addEventListener("pointermove", (e) => tip(e, el.dataset.tip));
-    el.addEventListener("pointerleave", () => tip(null, ""));
-    el.addEventListener("focus", () => { const r = el.getBoundingClientRect(); tip({ clientX: r.right, clientY: r.top }, el.dataset.tip); });
-    el.addEventListener("blur", () => tip(null, ""));
+    el.addEventListener("pointermove", (e) => { if (e.pointerType === "mouse") tip(e, el.dataset.tip); });
+    el.addEventListener("pointerleave", (e) => { if (e.pointerType === "mouse") hideTip(); });
+    el.addEventListener("pointerup", (e) => {
+      if (e.pointerType === "mouse") return;
+      tip(e, el.dataset.tip); clearTimeout(tipTimer); tipTimer = setTimeout(hideTip, 2500);
+    });
+    el.addEventListener("focus", () => {
+      if (!el.matches(":focus-visible")) return;  // keyboard only; taps are handled above
+      const r = el.getBoundingClientRect(); tip({ clientX: r.left, clientY: r.bottom }, el.dataset.tip);
+    });
+    el.addEventListener("blur", hideTip);
   });
 }
 function barChart(rows, { total, unit = "bills", href } = {}) {
@@ -1626,7 +1646,109 @@ function bindVersions(d) {
   });
 }
 
+// ------------------------------------------------------------------ legislator directory
+const DIR = { rows: null };
+async function showDirectory() {
+  $("#dir-profile").hidden = true; $("#dir-list-wrap").hidden = false;
+  if (!DIR.rows) {
+    $("#dir-list").innerHTML = `<li class="hint">Loading…</li>`;
+    try { const d = await api(`/api/legislators?session=${state.session}`); DIR.rows = d.members; DIR.updated = d.updated; }
+    catch (e) { $("#dir-list").innerHTML = `<li class="hint">${esc(e.message)}</li>`; return; }
+  }
+  renderDirectory();
+}
+function legTitle(r) { return `${r.chamber === "House" ? "Rep." : "Sen."} ${r.name}`; }
+function partyLetter(p) { return /^rep/i.test(p) ? "R" : /^dem/i.test(p) ? "D" : (p || "").slice(0, 1); }
+function renderDirectory() {
+  const rows = DIR.rows || [];
+  if (!rows.length) {
+    $("#dir-list").innerHTML = `<li class="empty"><h2>The directory is loading for the first time</h2><p>It reads every member’s page from the House and Senate websites, which takes about two minutes. Tap “Refresh” above if it doesn’t appear.</p></li>`;
+    return;
+  }
+  const q = $("#dir-q").value.trim().toLowerCase(), ch = $("#dir-chamber").value, area = $("#dir-area").value, party = $("#dir-party").value, sort = $("#dir-sort").value;
+  let list = rows.filter((r) => (!ch || r.chamber === ch) && (!party || r.party === party) && (!area || r[area]) &&
+    (!q || [r.name, r.hometown, r.counties.join(" "), r.cities.join(" "), r.committees.join(" "), `district ${r.district}`, r.leadership].join(" ").toLowerCase().includes(q)));
+  const by = { name: (a, b) => a.last.localeCompare(b.last) || a.first.localeCompare(b.first), onevoice: (a, b) => b.onevoice_count - a.onevoice_count || a.last.localeCompare(b.last),
+    meetings: (a, b) => b.meetings_count - a.meetings_count || a.last.localeCompare(b.last), district: (a, b) => a.chamber.localeCompare(b.chamber) || a.district - b.district };
+  list = list.slice().sort(by[sort]);
+  $("#dir-meta").textContent = `${list.length} of ${rows.length} members` + (DIR.updated ? ` · updated ${ago(DIR.updated)}` : "");
+  $("#dir-list").innerHTML = list.map((r) => `<li><a class="leg-card" href="#legislator-${esc(r.key.replace(":", "-"))}">
+      ${r.photo ? `<img src="${esc(r.photo)}" alt="" loading="lazy" referrerpolicy="no-referrer" data-initials="${esc((r.first[0] || "") + (r.last[0] || ""))}">` : `<span class="leg-ph" aria-hidden="true">${esc((r.first[0] || "") + (r.last[0] || ""))}</span>`}
+      <span class="leg-main"><b>${esc(legTitle(r))}</b>
+        <span class="hint">${esc(partyLetter(r.party))}-${esc(r.chamber)} District ${esc(r.district)}${r.hometown ? ` · ${esc(r.hometown.replace(/, Oklahoma$/, ""))}` : ""}</span>
+        ${r.leadership ? `<span class="hint">${esc(r.leadership)}</span>` : ""}
+        <span class="leg-chips">${r.tulsa ? '<span class="chip chip-tulsa">Tulsa County</span>' : r.region ? '<span class="chip chip-tulsa">Tulsa region</span>' : ""}
+          ${r.onevoice_count ? `<span class="chip">${r.onevoice_count} OneVoice bill${r.onevoice_count === 1 ? "" : "s"}</span>` : ""}
+          ${r.meetings_count ? `<span class="chip">${r.meetings_count} meeting${r.meetings_count === 1 ? "" : "s"}</span>` : ""}</span></span></a></li>`).join("")
+    || `<li class="empty"><h2>No one matches</h2><p>Try a different name, town or county.</p></li>`;
+  photoFallback($("#dir-list"));
+}
+async function openLegislator(slugKey) {
+  const [ch, ...rest] = slugKey.split("-");
+  const slug = rest.join("-");
+  $("#dir-list-wrap").hidden = true;
+  const box = $("#dir-profile"); box.hidden = false;
+  box.innerHTML = `<p class="hint">Loading…</p>`;
+  let r;
+  try { r = await api(`/api/legislators/${ch}/${encodeURIComponent(slug)}?session=${state.session}`); }
+  catch (e) { box.innerHTML = `<a class="btn btn-ghost btn-sm" href="#directory">‹ All legislators</a><p class="hint">${esc(e.message)}</p>`; return; }
+  const contact = [r.email ? `<a class="btn btn-sm" href="mailto:${esc(r.email)}">Email</a>` : r.contact_url ? `<a class="btn btn-sm" href="${esc(r.contact_url)}" target="_blank" rel="noopener">Email (Senate form)</a>` : "",
+    r.phone ? `<a class="btn btn-ghost btn-sm" href="tel:${esc(r.phone.replace(/[^0-9+]/g, ""))}">Call ${esc(r.phone)}</a>` : "",
+    `<a class="btn btn-ghost btn-sm" href="${esc(r.page_url)}" target="_blank" rel="noopener">Official page</a>`].join("");
+  box.innerHTML = `<a class="btn btn-ghost btn-sm" href="#directory">‹ All legislators</a>
+    <div class="leg-head">${r.photo ? `<img src="${esc(r.photo)}" alt="" referrerpolicy="no-referrer" data-initials="${esc((r.first[0] || "") + (r.last[0] || ""))}">` : ""}
+      <div><h2>${esc(legTitle(r))}</h2>
+        <p>${esc(r.party)} · ${esc(r.chamber)} District ${esc(r.district)}${r.hometown ? ` · ${esc(r.hometown)}` : ""}</p>
+        ${r.leadership ? `<p class="hint">${esc(r.leadership)}</p>` : ""}
+        <div class="row-end">${contact}</div></div></div>
+    <div class="leg-grid">
+      <section class="panel"><h3 class="section-h">Office</h3>
+        <p>${esc(r.office || "–")}</p>${r.assistant ? `<p><b>Assistant:</b> ${esc(r.assistant)}</p>` : ""}
+        ${r.email ? `<p><b>Email:</b> <a href="mailto:${esc(r.email)}">${esc(r.email)}</a></p>` : ""}
+        ${r.term_limited ? `<p class="hint">Term limited in ${esc(r.term_limited)}</p>` : ""}</section>
+      <section class="panel"><h3 class="section-h">District</h3>
+        <p><b>Counties:</b> ${esc(r.counties.join(", ") || "–")}</p>
+        ${r.cities.length ? `<p><b>Towns:</b> ${esc(r.cities.join(", "))}</p>` : ""}</section>
+      <section class="panel"><h3 class="section-h">Committees</h3>
+        ${r.committees.length ? `<ul class="plain">${r.committees.map((c) => `<li>${esc(c)}</li>`).join("")}</ul>` : `<p class="hint">None listed.</p>`}</section>
+    </div>
+    ${r.hearings.length ? `<section class="panel wide"><h3 class="section-h">Their upcoming committee meetings</h3><ul class="plain">${r.hearings.map((m) => `<li><a href="#calendar">${esc(fmtWhen(m.start, m.time_text))} · ${esc(m.committee)}</a>${m.bills.length ? ` <span class="hint">· ${esc(m.bills.slice(0, 8).join(", "))}</span>` : ""}</li>`).join("")}</ul></section>` : ""}
+    <section class="panel wide"><div class="row-between"><h3 class="section-h">Meetings with the Chamber (${r.meetings.length})</h3>
+      <button class="btn btn-sm" type="button" id="leg-log">+ Log a meeting with ${esc(r.chamber === "House" ? "Rep." : "Sen.")} ${esc(r.last)}</button></div>
+      ${r.meetings.length ? `<ol class="log-list">${r.meetings.map((e) => `<li class="log-card"><div class="log-top"><span class="date">${fmtDate(e.date)}</span>${e.staff ? `<span class="hint">with ${esc(e.staff)}</span>` : ""}</div>
+        ${e.overview ? `<p class="log-overview">${esc(e.overview)}</p>` : ""}${e.follow_up ? `<p><b>Follow-up:</b> ${esc(e.follow_up)}</p>` : ""}</li>`).join("")}</ol>`
+        : `<p class="hint">No meetings logged yet. Meetings count here when the legislator’s name is in “Who met.”</p>`}</section>
+    <section class="panel wide"><h3 class="section-h">Bills they authored (${r.bills.length}${r.onevoice_count ? `, ${r.onevoice_count} OneVoice` : ""})</h3>
+      ${r.bills.length ? `<ul class="leg-bills">${r.bills.map((b) => `<li><button class="linklike" type="button" data-open-bill="${esc(b.bill)}"><b>${esc(b.display)}</b></button>
+        ${b.onevoice.map((t) => `<span class="chip chip-ov">${esc(t)}</span>`).join("")}${b.position ? `<span class="pill pos-${esc(b.position)}">${esc(cap(b.position))}</span>` : ""}
+        <div>${esc(b.title)}</div><div class="hint">${b.role === "primary" ? "Author" : "Principal author in the other chamber"} · ${esc(b.stage_label)}</div></li>`).join("")}</ul>`
+        : `<p class="hint">No bills found yet. This lists OneVoice and tracked bills, plus any bill you’ve opened, this session.</p>`}</section>`;
+  photoFallback(box);
+  box.querySelectorAll("[data-open-bill]").forEach((b) => b.addEventListener("click", () => openBill(state.session, b.dataset.openBill)));
+  $("#leg-log").addEventListener("click", () => {
+    location.hash = "#meetings";
+    setTimeout(() => openMeetingForm({ people: legTitle(r), level: "state", entity: r.chamber === "House" ? "Oklahoma House of Representatives" : "Oklahoma State Senate" }), 150);
+  });
+  window.scrollTo(0, 0);
+}
+function photoFallback(root) {
+  root.querySelectorAll("img").forEach((img) => img.addEventListener("error", () => {
+    const span = document.createElement("span"); span.className = "leg-ph"; span.setAttribute("aria-hidden", "true");
+    span.textContent = img.dataset.initials || ""; img.replaceWith(span);
+  }, { once: true }));
+}
+function bindDirectory() {
+  let t;
+  $("#dir-q").addEventListener("input", () => { clearTimeout(t); t = setTimeout(renderDirectory, 150); });
+  ["#dir-chamber", "#dir-area", "#dir-party", "#dir-sort"].forEach((id) => $(id).addEventListener("change", renderDirectory));
+  $("#dir-refresh").addEventListener("click", async () => {
+    try { await api("/api/legislators/refresh", { method: "POST" }); toast("Reading every member’s page. This takes about two minutes."); pollStatus(); }
+    catch (e) { toast(e.message, true); }
+  });
+}
+
 function bindNewFeatures() {
+  bindDirectory();
   $("#sb-table-toggle").addEventListener("click", (e) => { sbTables = !sbTables; e.target.setAttribute("aria-pressed", String(sbTables)); e.target.textContent = sbTables ? "Show as charts" : "Show as tables"; loadScoreboard(); });
   $("#goals-year").addEventListener("change", (e) => { G.year = Number(e.target.value); loadGoals(); });
   document.querySelectorAll("#goals-tabs [data-gtab]").forEach((b) => b.addEventListener("click", () => { G.tab = b.dataset.gtab; renderGoalTabs(); }));
