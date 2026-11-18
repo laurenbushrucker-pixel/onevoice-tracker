@@ -159,7 +159,7 @@ logs. Set `BILLTRACKER_GOAL_YEAR` to change the default year (2027).
 The Legislators screen lists all 149 House and Senate members from okhouse.gov
 and oksenate.gov (refreshed weekly, or with the Refresh button): photo, party,
 district, hometown, email or contact form, office, phone, assistant, committees,
-and the counties and towns in their district. Filter to Tulsa County or the
+and the counties and towns in their district. Filter to the Tulsa Area or the
 seven-county Tulsa region. Each profile shows the OneVoice and tracked bills
 they authored (taken from the author links on oklegislature.gov), their
 upcoming committee meetings, and every meeting your team logged with them, with
