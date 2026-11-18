@@ -203,6 +203,10 @@ def init_db() -> None:
             c.execute("ALTER TABLE summaries ADD COLUMN checked_at TEXT")
         if not c.execute("SELECT 1 FROM priorities LIMIT 1").fetchone():
             seed_priorities(c)
+    saved = meta_get("settings") or {}
+    if APP_URL and ".sslip.io" in (saved.get("app_url") or "") and ".sslip.io" not in APP_URL:
+        saved["app_url"] = APP_URL  # the server moved to its own address: follow it in emails and links
+        meta_set("settings", saved)
     if FTS_OK() and not meta_get("fts_built"):
         rebuild_fts()
         meta_set("fts_built", now_iso())

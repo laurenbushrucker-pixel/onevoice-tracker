@@ -169,8 +169,10 @@ echo "$RUN_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart $SERVICE" \
   | sudo tee /etc/sudoers.d/$SERVICE >/dev/null
 sudo chmod 440 /etc/sudoers.d/$SERVICE
 
+SITES="$DOMAIN"
+[ "$DOMAIN" != "$DEFAULT_DOMAIN" ] && SITES="$DOMAIN, $DEFAULT_DOMAIN"  # keep the free address as a backup
 sudo tee /etc/caddy/Caddyfile >/dev/null <<EOF
-$DOMAIN {
+$SITES {
 	encode gzip
 	reverse_proxy 127.0.0.1:5000
 }
