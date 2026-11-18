@@ -1677,7 +1677,7 @@ function renderDirectory() {
       <span class="leg-main"><b>${esc(legTitle(r))}</b>
         <span class="hint">${esc(partyLetter(r.party))}-${esc(r.chamber)} District ${esc(r.district)}${r.hometown ? ` · ${esc(r.hometown.replace(/, Oklahoma$/, ""))}` : ""}</span>
         ${r.leadership ? `<span class="hint">${esc(r.leadership)}</span>` : ""}
-        <span class="leg-chips">${r.tulsa ? '<span class="chip chip-tulsa">Tulsa Area</span>' : r.region ? '<span class="chip chip-tulsa">Tulsa region</span>' : ""}
+        <span class="leg-chips">${r.region ? '<span class="chip chip-tulsa">Tulsa Region</span>' : ""}
           ${r.onevoice_count ? `<span class="chip">${r.onevoice_count} OneVoice bill${r.onevoice_count === 1 ? "" : "s"}</span>` : ""}
           ${r.meetings_count ? `<span class="chip">${r.meetings_count} meeting${r.meetings_count === 1 ? "" : "s"}</span>` : ""}</span></span></a></li>`).join("")
     || `<li class="empty"><h2>No one matches</h2><p>Try a different name, town or county.</p></li>`;
