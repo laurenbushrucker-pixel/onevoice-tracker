@@ -11,10 +11,12 @@ const state = {
   stageFilter: "",
   find: { offset: 0, total: 0, results: [] },
   nb: { offset: 0, total: 0, results: [] },
+  press: { offset: 0, total: 0, results: [] },
+  calWeek: null,
   drawer: null, // { session, bill, data }
   editing: null, // priority id whose keywords are open
 };
-const VIEWS = ["agenda", "newbills", "mine", "find", "updates", "settings"];
+const VIEWS = ["home", "newbills", "calendar", "press", "agenda", "mine", "find", "updates", "settings", "more"];
 const STAGE_ORDER = ["introduced", "committee", "floor", "crossed", "passed", "governor", "law"];
 const PROGRESS_LABELS = ["Filed", "Committee", "Floor", "2nd chamber", "Passed", "Governor", "Enacted"];
 const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
@@ -197,6 +199,241 @@ function bindReviews(root, onChange) {
   }));
 }
 
+// ------------------------------------------------------------------ home
+async function loadHome() {
+  let h;
+  try { h = await api(`/api/home?session=${state.session}`); } catch { return; }
+  const hour = new Date().getHours();
+  $("#home-hello").textContent = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
+  $("#home-sub").textContent = h.to_review ? `${h.to_review} new OneVoice bill${h.to_review === 1 ? "" : "s"} to review` : "You’re all caught up.";
+  $("#tile-bills").textContent = h.new_bills ? `${h.new_bills} new this week${h.to_review ? ` · ${h.to_review} to review` : ""}` : "Bills matching the agenda";
+  $("#tile-cal").textContent = h.meetings_this_week ? `${h.meetings_this_week} meeting${h.meetings_this_week === 1 ? "" : "s"} this week` : "Committee meetings and agendas";
+  $("#tile-press").textContent = h.press_new ? `${h.press_new} new this week` : "Senate, House, Governor, agencies";
+  $("#tile-mine").textContent = h.tracked ? `${h.tracked} tracked${h.updates ? ` · ${h.updates} update${h.updates === 1 ? "" : "s"}` : ""}` : "Bills with a Chamber position";
+  $("#nav-dot-bills").hidden = !h.to_review;
+  $("#home-hearings").hidden = !h.your_hearings.length;
+  $("#home-hearings-list").innerHTML = h.your_hearings.map((m) => `
+    <li><a href="#calendar"><b>${esc(m.your_bills.join(", "))}</b> · ${esc(m.chamber)} ${esc(m.committee)}
+      <span class="date">${esc(fmtWhen(m.start, m.time_text))}${m.location ? " · " + esc(m.location) : ""}</span></a></li>`).join("");
+  renderGetApp();
+}
+function fmtWhen(iso, fallback) {
+  if (!iso) return fallback || "";
+  const d = new Date(iso);
+  return d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" }) + " · " + d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
+}
+
+// ------------------------------------------------------------------ calendar
+function mondayOf(d) {
+  const x = new Date(d); x.setHours(0, 0, 0, 0);
+  x.setDate(x.getDate() - ((x.getDay() + 6) % 7));
+  return x;
+}
+function isoDate(d) { return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; }
+async function loadCalendar() {
+  if (!state.calWeek) state.calWeek = mondayOf(new Date());
+  const wk = isoDate(state.calWeek);
+  const end = new Date(state.calWeek); end.setDate(end.getDate() + 6);
+  const thisWeek = isoDate(mondayOf(new Date())) === wk;
+  $("#cal-week").textContent = thisWeek ? "This week" : `Week of ${state.calWeek.toLocaleDateString(undefined, { month: "short", day: "numeric" })}`;
+  $("#cal-days").innerHTML = `<p class="hint">Loading meetings…</p>`;
+  let data;
+  try { data = await api(`/api/calendar?session=${state.session}&week=${wk}`); } catch (e) { $("#cal-days").innerHTML = `<p class="hint">${esc(e.message)}</p>`; return; }
+  $("#cal-updated").textContent = `${state.calWeek.toLocaleDateString(undefined, { month: "short", day: "numeric" })} – ${end.toLocaleDateString(undefined, { month: "short", day: "numeric" })}` + (data.updated ? ` · checked ${ago(data.updated)}` : "");
+  const only = $("#cal-only").checked;
+  const days = [];
+  for (let i = 0; i < 7; i++) {
+    const d = new Date(state.calWeek); d.setDate(d.getDate() + i);
+    const key = isoDate(d);
+    const ms = data.meetings.filter((m) => (m.start || "").slice(0, 10) === key && (!only || m.bills.some((b) => b.onevoice || b.watch)));
+    const dl = data.deadlines.filter((x) => x.date === key);
+    if (!ms.length && !dl.length) continue;
+    days.push(`<section class="cal-day${key === isoDate(new Date()) ? " today" : ""}">
+      <h3>${d.toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}${key === isoDate(new Date()) ? ' <span class="today-pill">Today</span>' : ""}</h3>
+      ${dl.map((x) => `<div class="deadline">📌 ${esc(x.label)}</div>`).join("")}
+      ${ms.map(meetingCard).join("")}
+    </section>`);
+  }
+  $("#cal-days").innerHTML = days.join("") || `<div class="empty"><h2>${only ? "No meetings with OneVoice bills this week" : "No committee meetings posted for this week"}</h2>
+    <p>${thisWeek ? "Meeting notices usually go up a few days ahead. New ones appear here within 20 minutes of being posted." : "Try another week."}</p></div>`;
+  $("#cal-days").querySelectorAll("[data-open-bill]").forEach((b) => b.addEventListener("click", () => openBill(state.session, b.dataset.openBill)));
+}
+function meetingCard(m) {
+  const cancelled = /cancel|postpon/i.test(`${m.status} ${m.title}`);
+  const revised = /revis/i.test(m.title);
+  const time = m.start ? new Date(m.start).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" }) : (m.time_text || "");
+  const bills = m.bills.slice().sort((a, b) => (b.watch ? 2 : b.onevoice ? 1 : 0) - (a.watch ? 2 : a.onevoice ? 1 : 0));
+  return `<article class="meeting${cancelled ? " cancelled" : ""}">
+    <div class="m-time">${esc(time)}</div>
+    <div class="m-body">
+      <div class="m-head"><span class="chamber-pill ch-${esc(m.chamber.toLowerCase())}">${esc(m.chamber)}</span>
+        <b>${esc(m.committee)}</b>${cancelled ? ' <span class="pill st-vetoed">Cancelled</span>' : revised ? ' <span class="pill st-passed">Revised</span>' : ""}</div>
+      <div class="m-where">${esc(m.location || "")}</div>
+      ${bills.length ? `<div class="m-bills">${bills.map((b) => `<button type="button" class="bill-chip${b.watch ? " watch" : b.onevoice ? " ov" : ""}" data-open-bill="${esc(b.bill)}" title="${esc(b.title)}">${esc(b.display)}${b.watch ? " ★" : ""}</button>`).join("")}</div>` : (m.agenda_url ? "" : `<div class="hint">Agenda not posted yet.</div>`)}
+      ${m.removed.length ? `<div class="hint">Removed: ${esc(m.removed.join(", "))}</div>` : ""}
+      <div class="m-links">${m.agenda_url ? `<a class="btn btn-sm" href="${esc(m.agenda_url)}" target="_blank" rel="noopener">Agenda (PDF)</a>` : ""}
+        <a class="btn btn-ghost btn-sm" href="${esc(m.page_url)}" target="_blank" rel="noopener">Watch / details</a></div>
+    </div></article>`;
+}
+
+// ------------------------------------------------------------------ press
+async function runPress(reset) {
+  if (reset) state.press = { offset: 0, total: 0, results: [] };
+  const p = new URLSearchParams({ session: state.session, q: $("#press-q").value.trim(), source: $("#press-source").value,
+    show: $("#press-show").value, offset: state.press.offset, limit: 30 });
+  $("#press-meta").textContent = "Loading…";
+  try {
+    const d = await api(`/api/press?${p}`);
+    if ($("#press-source").options.length <= 1) $("#press-source").innerHTML += d.sources.map((x) => `<option>${esc(x)}</option>`).join("");
+    state.press.total = d.total; state.press.results = state.press.results.concat(d.results); state.press.offset = state.press.results.length;
+    $("#press-meta").textContent = d.total ? `${d.total.toLocaleString()} release${d.total === 1 ? "" : "s"}, newest first${d.updated ? ` · checked ${ago(d.updated)}` : ""}` : "No press releases match.";
+    $("#press-list").innerHTML = state.press.results.map((r) => `
+      <li class="press-card">
+        <div class="press-top"><span class="src-pill">${esc(r.source)}</span><span class="date">${fmtDate((r.published || r.first_seen || "").slice(0, 10))}</span></div>
+        <a class="press-title" href="${esc(r.url)}" target="_blank" rel="noopener">${esc(r.title)}</a>
+        ${r.excerpt ? `<p class="press-excerpt">${esc(r.excerpt.slice(0, 220))}${r.excerpt.length > 220 ? "…" : ""}</p>` : ""}
+        ${(r.bills.length || r.priorities.length) ? `<div class="m-bills">${r.bills.map((b) => `<button type="button" class="bill-chip${b.watch ? " watch" : ""}" data-open-bill="${esc(b.bill)}">${esc(b.display)}${b.watch ? " ★" : ""}</button>`).join("")}${r.priorities.map((p2) => `<span class="agenda-tag">${esc(p2.label)}</span>`).join("")}</div>` : ""}
+      </li>`).join("");
+    $("#press-more").hidden = state.press.results.length >= state.press.total;
+    $("#press-list").querySelectorAll("[data-open-bill]").forEach((b) => b.addEventListener("click", () => openBill(state.session, b.dataset.openBill)));
+  } catch (e) { $("#press-meta").textContent = e.message; }
+}
+
+// ------------------------------------------------------- phone app & notifications
+let swReg = null;
+async function registerServiceWorker() {
+  if (!("serviceWorker" in navigator)) return;
+  try {
+    swReg = await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+    navigator.serviceWorker.addEventListener("message", (e) => {
+      if (e.data && e.data.type === "open" && e.data.url) { const u = new URL(e.data.url); location.hash = u.hash || "#home"; route(); }
+    });
+  } catch { /* not available here; the site still works */ }
+}
+const isStandalone = () => window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isAndroid = () => /android/i.test(navigator.userAgent);
+let deferredInstall = null;
+window.addEventListener("beforeinstallprompt", (e) => { e.preventDefault(); deferredInstall = e; renderGetApp(); renderInstallHelp(); });
+
+function installSteps() {
+  if (isStandalone()) return `<p class="ok-line">✓ Installed on this device.</p>`;
+  if (isIOS()) return `<ol class="steps"><li>Open this page in <b>Safari</b>.</li><li>Tap the <b>Share</b> button <span aria-hidden="true">(the square with an arrow)</span>.</li><li>Scroll down and tap <b>Add to Home Screen</b>, then <b>Add</b>.</li><li>Open <b>OneVoice</b> from your home screen and turn on notifications.</li></ol>`;
+  if (deferredInstall) return `<button class="btn" type="button" id="install-btn">Install the app</button>`;
+  if (isAndroid()) return `<ol class="steps"><li>Tap Chrome’s <b>⋮</b> menu.</li><li>Tap <b>Install app</b> (or <b>Add to Home screen</b>).</li></ol>`;
+  return `<p class="hint">On your phone, open this site and add it to your home screen: Safari ▸ Share ▸ Add to Home Screen on iPhone, or Chrome ▸ ⋮ ▸ Install app on Android. On a computer, Chrome and Edge show an install button in the address bar.</p>`;
+}
+function bindInstallBtn() {
+  const b = document.getElementById("install-btn");
+  if (b) b.addEventListener("click", async () => { deferredInstall.prompt(); await deferredInstall.userChoice; deferredInstall = null; renderGetApp(); renderInstallHelp(); });
+}
+function renderInstallHelp() { $("#install-help").innerHTML = `<h3 class="sub-h">Get the app</h3>${installSteps()}`; bindInstallBtn(); }
+async function renderGetApp() {
+  const sub = await currentSubscription();
+  const box = $("#get-app");
+  if (isStandalone() && sub) { box.hidden = true; return; }
+  box.hidden = false;
+  box.innerHTML = isStandalone()
+    ? `<b>Turn on notifications</b><p class="hint">Get new OneVoice bills, hearings and press releases on your lock screen.</p><a class="btn" href="#settings">Set up notifications</a>`
+    : `<b>Put OneVoice on your home screen</b><p class="hint">It opens like an app and can send notifications.</p>${installSteps()}`;
+  bindInstallBtn();
+}
+async function currentSubscription() {
+  if (!swReg || !("PushManager" in window)) return null;
+  try { return await swReg.pushManager.getSubscription(); } catch { return null; }
+}
+function b64ToUint8(b64) {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+async function renderPush() {
+  const status = $("#push-status"), toggle = $("#push-toggle"), test = $("#push-test"), kinds = $("#push-kinds");
+  if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) {
+    status.textContent = isIOS() && !isStandalone()
+      ? "On iPhone, notifications work once OneVoice is added to your home screen (iOS 16.4 or later). Follow the steps above, then open it from the home screen."
+      : "This browser can’t receive notifications.";
+    toggle.hidden = test.hidden = kinds.hidden = true; return;
+  }
+  if (!swReg) { try { swReg = await navigator.serviceWorker.ready; } catch { /* */ } }
+  const sub = await currentSubscription();
+  let info = { subscribed: false, prefs: null };
+  if (sub) { try { info = await api("/api/push/status", { method: "POST", body: { endpoint: sub.endpoint } }); } catch { /* */ } }
+  const on = sub && info.subscribed;
+  if (Notification.permission === "denied") {
+    status.textContent = "Notifications are blocked for this site. Allow them in your phone’s or browser’s settings for this site, then come back.";
+    toggle.hidden = true;
+  } else {
+    status.textContent = on ? "✓ Notifications are on for this device. Choose what to get:" : "Get alerts on this device’s lock screen, even when the app is closed.";
+    toggle.hidden = false; toggle.textContent = on ? "Turn off notifications" : "Turn on notifications";
+    toggle.className = on ? "btn btn-ghost" : "btn";
+  }
+  test.hidden = !on; kinds.hidden = !on;
+  if (on) {
+    const k = (await api("/api/push/key")).kinds;
+    kinds.innerHTML = Object.entries(k).map(([key, label]) => `<label class="check" for="pk-${key}"><input type="checkbox" id="pk-${key}" data-kind="${key}" ${!info.prefs || info.prefs[key] !== false ? "checked" : ""}> ${esc(label)}</label>`).join("");
+    kinds.querySelectorAll("[data-kind]").forEach((c) => c.addEventListener("change", async () => {
+      const prefs = Object.fromEntries([...kinds.querySelectorAll("[data-kind]")].map((x) => [x.dataset.kind, x.checked]));
+      try { await api("/api/push/prefs", { method: "POST", body: { endpoint: sub.endpoint, prefs } }); toast("Saved"); } catch (e) { toast(e.message, true); }
+    }));
+  }
+}
+async function togglePush() {
+  const sub = await currentSubscription();
+  try {
+    if (sub) {
+      await api("/api/push/unsubscribe", { method: "POST", body: { endpoint: sub.endpoint } });
+      await sub.unsubscribe();
+      toast("Notifications turned off on this device");
+    } else {
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") { toast("Notifications weren’t allowed. You can allow them in your settings later.", true); renderPush(); return; }
+      const { key } = await api("/api/push/key");
+      const reg = swReg || await navigator.serviceWorker.ready;
+      const fresh = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToUint8(key) });
+      const label = isIOS() ? "iPhone" : isAndroid() ? "Android phone" : "Computer";
+      await api("/api/push/subscribe", { method: "POST", body: { subscription: fresh.toJSON(), label } });
+      toast("Notifications are on for this device");
+    }
+  } catch (e) { toast(e.message || "Couldn’t change notifications", true); }
+  renderPush(); renderGetApp();
+}
+
+// ------------------------------------------------------- press sources
+async function loadSources() {
+  try {
+    const d = await api("/api/press/sources");
+    $("#src-list").innerHTML = d.sources.map((x) => `<li><b>${esc(x.name)}</b> <span class="hint">${esc(x.url.replace("https://", ""))}</span>
+      ${x.id.startsWith("c") ? `<button class="linkish" type="button" data-src-del="${esc(x.id)}">Remove</button>` : ""}</li>`).join("");
+    $("#src-list").querySelectorAll("[data-src-del]").forEach((b) => b.addEventListener("click", async () => {
+      await api(`/api/press/sources/${b.dataset.srcDel}`, { method: "DELETE" }); toast("Source removed"); loadSources();
+    }));
+  } catch { /* */ }
+}
+
+function bindAppFeatures() {
+  $("#cal-prev").addEventListener("click", () => { state.calWeek.setDate(state.calWeek.getDate() - 7); loadCalendar(); });
+  $("#cal-next").addEventListener("click", () => { state.calWeek.setDate(state.calWeek.getDate() + 7); loadCalendar(); });
+  $("#cal-today").addEventListener("click", () => { state.calWeek = mondayOf(new Date()); loadCalendar(); });
+  $("#cal-only").addEventListener("change", loadCalendar);
+  $("#press-form").addEventListener("submit", (e) => { e.preventDefault(); runPress(true); });
+  ["#press-source", "#press-show"].forEach((x) => $(x).addEventListener("change", () => runPress(true)));
+  $("#press-more").addEventListener("click", () => runPress(false));
+  $("#push-toggle").addEventListener("click", togglePush);
+  $("#push-test").addEventListener("click", async () => {
+    const sub = await currentSubscription();
+    try { await api("/api/push/test", { method: "POST", body: { endpoint: sub.endpoint } }); toast("Test notification sent"); } catch (e) { toast(e.message, true); }
+  });
+  $("#src-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api("/api/press/sources", { method: "POST", body: { url: $("#src-url").value.trim(), name: $("#src-name").value.trim() } });
+      toast(`Added. Found ${r.found} recent release${r.found === 1 ? "" : "s"}; new ones will appear within 15 minutes.`);
+      $("#src-url").value = ""; $("#src-name").value = ""; loadSources();
+    } catch (err) { toast(err.message, true); }
+  });
+}
+
 // ------------------------------------------------------------------ boot
 async function boot() {
   state.config = await api("/api/config");
@@ -213,7 +450,12 @@ async function boot() {
   fillAgendaSelects();
   $("#agenda-name").textContent = state.config.agenda_name;
 
+  $("#session-more").innerHTML = $("#session").innerHTML;
+  $("#session-more").value = state.session;
+  $("#session-more").addEventListener("change", (e) => { $("#session").value = e.target.value; $("#session").dispatchEvent(new Event("change")); });
+  registerServiceWorker();
   bindEvents();
+  bindAppFeatures();
   await loadSession();
   route();
   setInterval(pollStatus, 4000);
@@ -258,6 +500,11 @@ function bindEvents() {
   ["#find-agenda", "#find-dismissed", "#find-subject", "#find-chamber", "#find-stage", "#find-sort"].forEach((s) => $(s).addEventListener("change", () => {
     if (location.hash.startsWith("#bills-")) history.replaceState(null, "", "#find");
     $("#find-back").hidden = true;
+  if (h.startsWith("bill-")) {  // a notification or link to one bill: #bill-2700-HB1234
+    const [, sess, bill] = h.split("-");
+    history.replaceState(null, "", "#newbills");
+    if (sess && bill) openBill(sess, bill);
+  }
     runSearch(true);
   }));
   $("#find-more").addEventListener("click", () => runSearch(false));
@@ -295,7 +542,8 @@ async function startJob(url, message) {
 function currentView() {
   const h = location.hash.replace("#", "");
   if (h.startsWith("bills-")) return "find";
-  return VIEWS.includes(h) ? h : "agenda";
+  if (h.startsWith("bill-")) return "newbills";
+  return VIEWS.includes(h) ? h : "home";
 }
 function route() {
   const view = currentView();
@@ -318,6 +566,12 @@ function route() {
   document.querySelectorAll(".tabs a").forEach((a) => a.setAttribute("aria-current", a.dataset.view === view ? "page" : "false"));
   if (view === "find" && !state.find.results.length) runSearch(true);
   if (view === "newbills" && !state.nb.results.length) runNewBills(true);
+  if (view === "home") loadHome();
+  if (view === "calendar") loadCalendar();
+  if (view === "press" && !state.press.results.length) runPress(true);
+  document.querySelectorAll(".bottom-nav a").forEach((a) => a.setAttribute("aria-current",
+    a.dataset.view === view || (a.dataset.view === "more" && ["find", "mine", "agenda", "updates", "settings", "more"].includes(view)) ? "page" : "false"));
+  window.scrollTo(0, 0);
 }
 
 // ------------------------------------------------------------------ status
@@ -332,7 +586,7 @@ async function pollStatus() {
   const bar = $("#statusbar");
   if (job.running) {
     const pct = job.total ? Math.round((100 * job.done) / job.total) : 0;
-    const what = { index: "Building search index", filings: "Looking for newly filed bills", refresh: "Checking tracked bills", summaries: "Getting bill summaries", texts: "Reading bill texts" }[job.kind] || "Working";
+    const what = { index: "Building search index", filings: "Looking for newly filed bills", refresh: "Checking tracked bills", summaries: "Getting bill summaries", texts: "Reading bill texts", calendar: "Checking committee meetings", press: "Checking press releases" }[job.kind] || "Working";
     bar.innerHTML = `${what}: ${esc(job.label || "starting")} (${job.done}/${job.total || "?"})<span class="bar"><i style="width:${pct}%"></i></span>`;
   } else {
     const parts = [];
@@ -355,14 +609,17 @@ async function pollStatus() {
       if (currentView() === "find") runSearch(true);
       if (currentView() === "newbills") runNewBills(true);
       let msg = { index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
-        texts: "Bill texts updated",
+        texts: "Bill texts updated", calendar: "Calendar updated", press: "Press releases updated",
         summaries: job.result ? `Updated ${job.result.summarized} summar${job.result.summarized === 1 ? "y" : "ies"}` : "Summaries updated" }[job.kind];
       if (job.kind === "filings" && job.result) {
         const r = job.result;
         msg = `${r.new_bills} new bill${r.new_bills === 1 ? "" : "s"} found, ${r.new_matches} agenda match${r.new_matches === 1 ? "" : "es"}` +
           (r.sent ? `, alert emailed for ${r.sent}` : "") + (r.error ? `. Email failed: ${r.error}` : "");
       }
-      toast(job.error ? `Update failed: ${job.error}` : msg, !!(job.error || (job.result && job.result.error)));
+      const quiet = ["calendar", "press", "texts", "summaries"].includes(job.kind) && !job.error;  // background refreshes
+      if (currentView() === "calendar") loadCalendar();
+      if (currentView() === "home") loadHome();
+      if (!quiet) toast(job.error ? `Update failed: ${job.error}` : msg, !!(job.error || (job.result && job.result.error)));
     }
   }
 }
@@ -512,6 +769,9 @@ async function loadSettings() {
   const every = s.refresh_hours <= 0 ? null : s.refresh_hours === 1 ? "hour" : s.refresh_hours < 1 ? `${Math.round(s.refresh_hours * 60)} minutes` : `${s.refresh_hours} hours`;
   $("#movement-hint").textContent = (every ? `Tracked bills are re-checked every ${every}. ` : "Automatic re-checks of tracked bills are turned off on this server. ") +
     "Each bill that moves gets one email listing its new actions.";
+  $("#s-hearing").checked = s.hearing_email;
+  $("#s-press").value = s.press_email;
+  renderInstallHelp(); renderPush(); loadSources();
   loadHealth();
   const watching = state.status ? state.status.alerts_watch : s.alert_sessions.some((x) => x.code === state.session);
   const on = s.alerts_enabled && s.email_configured && s.recipients.length;
@@ -538,6 +798,9 @@ async function loadHealth() {
           ? `Failing: ${esc(h.email.last_error)}` : `Working${h.email.last_sent ? ` · last alert ${esc(h.email.last_sent)}` : ""}`),
     row(h.checkin.at ? !!h.checkin.sent : null, "Daily check-in", h.checkin.at ? `Last sent ${esc(h.checkin.at)}` : `First one goes out at ${h.checkin.hour} a.m. Central`),
     row(h.backup.at ? true : null, "Backups", h.backup.at ? `Server copy ${esc(h.backup.at)} · 14 days kept` : "First server copy is made with the daily check-in"),
+    row(h.calendar.at ? !h.calendar.errors.length : null, "Committee calendar", h.calendar.at ? `Every ${h.calendar.every_minutes} minutes · last ${esc(h.calendar.at)}${h.calendar.errors.length ? " · " + esc(h.calendar.errors[0]) : ""}` : "Not checked yet"),
+    row(h.press.at ? !h.press.errors.length : null, "Press releases", h.press.at ? `Every ${h.press.every_minutes} minutes · last ${esc(h.press.at)}${h.press.errors.length ? " · " + esc(h.press.errors[0]) : ""}` : "Not checked yet"),
+    row(h.push_devices ? true : null, "Phone notifications", h.push_devices ? `${h.push_devices} device${h.push_devices === 1 ? "" : "s"} signed up` : "No devices yet"),
   ].join("");
   renderBanner();
 }
@@ -560,6 +823,8 @@ async function saveSettings(e) {
       checkin_enabled: $("#s-checkin").checked,
       checkin_backup: $("#s-checkin-backup").checked,
       movement_enabled: $("#s-movement").checked,
+      hearing_email: $("#s-hearing").checked,
+      press_email: $("#s-press").value,
       movement_categories: [...document.querySelectorAll("#s-cats [data-cat]")].filter((x) => x.checked).map((x) => x.dataset.cat),
     } });
     toast("Settings saved");

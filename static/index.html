@@ -2,8 +2,16 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>OneVoice Tracker</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#33393a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="OneVoice">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="/static/icons/apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/static/icons/favicon-32.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Public+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap">
 <link rel="stylesheet" href="/static/style.css">
@@ -27,12 +35,15 @@
     </div>
   </div>
   <nav class="wrap tabs" aria-label="Views">
+    <a href="#home" data-view="home">Home</a>
+    <a href="#newbills" data-view="newbills">OneVoice Bills</a>
+    <a href="#calendar" data-view="calendar">Calendar</a>
+    <a href="#press" data-view="press">Press</a>
+    <a href="#find" data-view="find">Bill Search</a>
+    <a href="#mine" data-view="mine">My Bills <span class="count" id="count-mine"></span></a>
     <a href="#agenda" data-view="agenda">Agenda</a>
-    <a href="#newbills" data-view="newbills">New bills</a>
-    <a href="#mine" data-view="mine">My bills <span class="count" id="count-mine"></span></a>
-    <a href="#find" data-view="find">Find bills</a>
     <a href="#updates" data-view="updates">Updates <span class="count count-alert" id="count-updates" hidden></span></a>
-    <a href="#settings" data-view="settings">Alerts &amp; settings</a>
+    <a href="#settings" data-view="settings">Settings</a>
   </nav>
 </header>
 
@@ -42,6 +53,67 @@
 </div>
 
 <main class="wrap">
+  <!-- Home: big buttons -->
+  <section id="view-home" class="view" hidden>
+    <div class="home-hello"><h2 id="home-hello">OneVoice Tracker</h2><p class="hint" id="home-sub"></p></div>
+    <div class="tiles" id="tiles">
+      <a class="tile tile-main" href="#newbills"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 3h9l5 5v13H6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 13l2.5 2.5L16 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></span><b>OneVoice Bills</b><span class="tile-sub" id="tile-bills">Bills matching the agenda</span></a>
+      <a class="tile" href="#calendar"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 10h18M8 3v4M16 3v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Calendar</b><span class="tile-sub" id="tile-cal">Committee meetings and agendas</span></a>
+      <a class="tile" href="#find"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 16l5 5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Bill Search</b><span class="tile-sub">Search every bill’s full text</span></a>
+      <a class="tile" href="#press"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 5h13v14H6a2 2 0 0 1-2-2z M17 9h3v8a2 2 0 0 1-2 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M7 9h7M7 13h7M7 16h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Press Releases</b><span class="tile-sub" id="tile-press">Senate, House, Governor, agencies</span></a>
+      <a class="tile" href="#mine"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></span><b>My Bills</b><span class="tile-sub" id="tile-mine">Bills with a Chamber position</span></a>
+      <a class="tile" href="#agenda"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14M5 12h14M5 19h9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>OneVoice Agenda</b><span class="tile-sub">The 21 state priorities</span></a>
+      <a class="tile" href="#settings"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 8 3 8H3s3-1 3-8M10 20a2 2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg></span><b>Alerts &amp; Settings</b><span class="tile-sub">Email, notifications, status</span></a>
+    </div>
+    <div class="panel get-app" id="get-app" hidden></div>
+    <div class="home-block" id="home-hearings" hidden>
+      <h3>Your bills in committee</h3>
+      <ol class="mini-list" id="home-hearings-list"></ol>
+    </div>
+  </section>
+
+  <!-- Calendar -->
+  <section id="view-calendar" class="view" hidden>
+    <div class="cal-head">
+      <button class="btn btn-ghost btn-round" id="cal-prev" type="button" aria-label="Previous week">‹</button>
+      <div class="cal-title"><b id="cal-week">This week</b><span class="hint" id="cal-updated"></span></div>
+      <button class="btn btn-ghost btn-round" id="cal-next" type="button" aria-label="Next week">›</button>
+    </div>
+    <div class="toolbar cal-tools">
+      <label class="check" for="cal-only"><input type="checkbox" id="cal-only"> Only meetings with OneVoice bills</label>
+      <button class="btn btn-ghost btn-sm" id="cal-today" type="button">This week</button>
+    </div>
+    <div id="cal-days" class="cal-days"></div>
+    <p class="hint">Meetings come from the House and Senate meeting schedules and are checked every 20 minutes. Agendas are read automatically to list the bills being heard. Tracked bills and bills you marked Relevant are highlighted, and you’re alerted when one is put on an agenda.</p>
+  </section>
+
+  <!-- Press releases -->
+  <section id="view-press" class="view" hidden>
+    <form class="toolbar" id="press-form">
+      <input id="press-q" type="search" placeholder="Search press releases" aria-label="Search press releases">
+      <select id="press-source" aria-label="Source"><option value="">All sources</option></select>
+      <select id="press-show" aria-label="Which releases">
+        <option value="">All releases</option><option value="agenda">Related to the agenda</option><option value="mine">Mentions my bills</option>
+      </select>
+      <button class="btn" type="submit">Search</button>
+    </form>
+    <p class="hint" id="press-meta"></p>
+    <ol class="press-list" id="press-list"></ol>
+    <div class="center"><button class="btn btn-ghost" id="press-more" type="button" hidden>Show more</button></div>
+  </section>
+
+  <!-- More (phones) -->
+  <section id="view-more" class="view" hidden>
+    <nav class="more-list" aria-label="More">
+      <a href="#find">Bill Search</a><a href="#mine">My Bills</a><a href="#agenda">OneVoice Agenda</a>
+      <a href="#updates">Updates on tracked bills</a><a href="#settings">Alerts &amp; Settings</a>
+    </nav>
+    <div class="panel">
+      <label class="stack" for="session-more">Legislative session<select id="session-more"></select></label>
+      <a class="btn btn-ghost" href="/logout">Sign out</a>
+    </div>
+  </section>
+
   <!-- Agenda -->
   <section id="view-agenda" class="view" hidden>
     <div class="agenda-head">
@@ -161,6 +233,16 @@
 
   <!-- Settings -->
   <section id="view-settings" class="view" hidden>
+    <div class="panel" id="app-panel">
+      <h2>Phone app &amp; notifications</h2>
+      <div id="install-help"></div>
+      <div class="push-box">
+        <p class="hint" id="push-status">Checking notifications on this device…</p>
+        <div class="row-end"><button class="btn" type="button" id="push-toggle" hidden>Turn on notifications</button>
+          <button class="btn btn-ghost btn-sm" type="button" id="push-test" hidden>Send a test notification</button></div>
+        <div class="cats" id="push-kinds" hidden></div>
+      </div>
+    </div>
     <div class="panel">
       <h2>Is everything working?</h2>
       <div id="health" class="health"></div>
@@ -187,6 +269,13 @@
         <p class="hint">The check-in lists the last 24 hours of activity. If it doesn’t arrive, the tracker may be down. You’ll also get an email right away if checks stop working, and another when it’s fixed.</p>
       </fieldset>
       <fieldset class="group">
+        <legend>Committee agendas and press releases</legend>
+        <label class="check" for="s-hearing"><input type="checkbox" id="s-hearing"> Email me when a tracked or Relevant bill is put on a committee agenda</label>
+        <label class="stack" for="s-press">Email press releases that
+          <select id="s-press"><option value="tracked">mention a bill I track or marked Relevant</option><option value="agenda">mention my bills or a OneVoice priority in the headline</option><option value="off">never email press releases</option></select>
+        </label>
+      </fieldset>
+      <fieldset class="group">
         <legend>When a tracked bill moves</legend>
         <label class="check" for="s-movement"><input type="checkbox" id="s-movement"> Email me when a bill I track has a new action</label>
         <div class="cats" id="s-cats"></div>
@@ -199,12 +288,31 @@
       <p class="hint" id="s-last"></p>
     </form>
     <div class="panel">
+      <h2>Press release sources</h2>
+      <p class="hint">Checked every 15 minutes. Add any oklahoma.gov newsroom (for example an agency’s News page) by pasting its link.</p>
+      <ul class="src-list" id="src-list"></ul>
+      <form class="toolbar" id="src-form">
+        <input id="src-url" placeholder="https://oklahoma.gov/…/newsroom.html" aria-label="Newsroom link">
+        <input id="src-name" placeholder="Name, e.g. Commerce" aria-label="Source name" style="flex:0 1 180px">
+        <button class="btn btn-sm" type="submit">Add source</button>
+      </form>
+    </div>
+    <div class="panel">
       <h2>Agenda keywords</h2>
       <p class="hint">Restore every priority’s keywords to the version that ships with the app. Your tracked bills and notes are kept.</p>
       <div class="row-end" id="reset-area"><button class="btn btn-ghost" type="button" id="agenda-reset">Restore default keywords</button></div>
     </div>
   </section>
 </main>
+
+<!-- Bottom tabs on phones -->
+<nav class="bottom-nav" aria-label="Main">
+  <a href="#home" data-view="home"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6h-6v6H4a1 1 0 0 1-1-1z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg><span>Home</span></a>
+  <a href="#newbills" data-view="newbills"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l5 5v13H6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9 13l2.5 2.5L16 11" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg><span>Bills</span><i class="nav-dot" id="nav-dot-bills" hidden></i></a>
+  <a href="#calendar" data-view="calendar"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 10h18M8 3v4M16 3v4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg><span>Calendar</span></a>
+  <a href="#press" data-view="press"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h13v14H6a2 2 0 0 1-2-2z M17 9h3v8a2 2 0 0 1-2 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg><span>Press</span></a>
+  <a href="#more" data-view="more"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="19" cy="12" r="1.8" fill="currentColor"/></svg><span>More</span></a>
+</nav>
 
 <!-- Bill detail -->
 <div class="scrim" id="scrim" hidden></div>

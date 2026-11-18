@@ -46,6 +46,46 @@ Each summary is labeled with its source on the website and in alert emails.
 gives an AI summary on filing day. This costs roughly 2–4 cents per bill. If
 the API call fails, the tracker falls back to the free summary.
 
+## Phone app
+
+The tracker installs on phones like an app (a "progressive web app"): it gets
+a home-screen icon, opens full screen, and can send notifications. No app
+store is involved and it's free.
+
+- **iPhone (iOS 16.4 or later):** open the site in Safari, tap Share, then
+  **Add to Home Screen**. Open OneVoice from the home screen, then go to
+  Settings and tap **Turn on notifications**.
+- **Android:** open the site in Chrome, tap ⋮, then **Install app**, and turn
+  on notifications in Settings.
+- **Home screen:** big buttons for OneVoice Bills, Calendar, Bill Search,
+  Press Releases, My Bills, the Agenda and Settings, with counts. On phones a
+  bottom tab bar keeps Home, Bills, Calendar and Press one tap away.
+- **Notifications** (choose per device): new OneVoice bills, tracked bills
+  that move, tracked or Relevant bills put on a committee agenda, and press
+  releases about your bills. Tapping one opens the right screen. They're sent
+  with standard Web Push (VAPID keys are created automatically and kept in
+  the database).
+
+## Committee calendar
+
+Every 20 minutes (`BILLTRACKER_CALENDAR_MINUTES`) the tracker reads the
+upcoming committee meetings that the House and Senate post to their meeting
+video systems, opens each meeting's page for its agenda PDF on
+oklegislature.gov, and reads the agenda to list the bills being heard
+(including "revised to remove" notes). The Calendar shows one week at a time
+with deadlines from the Senate's legislative calendar. Tracked bills (★) and
+OneVoice bills are highlighted, and when a tracked bill or one you marked
+Relevant is put on an agenda you get an email and a notification.
+
+## Press releases
+
+Every 15 minutes (`BILLTRACKER_PRESS_MINUTES`) the tracker collects press
+releases from the Senate, House, Governor, Health Care Authority and Attorney
+General, and from any oklahoma.gov newsroom you add under Settings. Each
+release is tagged with the bills it mentions and the OneVoice priorities it
+relates to. You can be emailed when a release mentions a bill you track (the
+default), when it mentions your bills or a priority in the headline, or never.
+
 ## New bills list and keyword search
 
 The **New bills** tab is a running list of every bill that matches the agenda,
@@ -327,6 +367,7 @@ sharing the address.
 | File | Role |
 |---|---|
 | `agenda.json` | The 21 OneVoice state priorities with their starting keywords. |
+| `sources.py` | Committee meetings and agendas (House and Senate meeting systems) and press releases. |
 | `summarize.py` | Bill summaries: official staff summaries, the bill's description, or (optional) Claude. |
 | `onevoice.py` | Keyword matching and the alert email. |
 | `oklegis.py` | Scraper for oklegislature.gov: the Subject Index, bill pages, and status from each bill's history. |

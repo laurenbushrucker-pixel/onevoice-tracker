@@ -34,6 +34,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 import oklegis as ok
 import onevoice as ov
+import sources as so
 import summarize as sm
 
 ROOT = Path(__file__).resolve().parent
@@ -47,6 +48,8 @@ CHECKIN_HOUR = int(os.environ.get("BILLTRACKER_CHECKIN_HOUR", "7"))  # daily che
 BACKUPS_KEPT = 14
 STARTED_AT = datetime.now(timezone.utc)
 FTS_TABLE = True  # set False at startup when SQLite lacks FTS5
+CALENDAR_MINUTES = float(os.environ.get("BILLTRACKER_CALENDAR_MINUTES", "20"))  # meeting notices and agendas
+PRESS_MINUTES = float(os.environ.get("BILLTRACKER_PRESS_MINUTES", "15"))  # press releases
 INDEX_HOURS = float(os.environ.get("BILLTRACKER_INDEX_HOURS", "6"))  # full index rebuild, the safety net; 0 = off
 # How often to look for newly filed bills. Speed is the point, so the default is every 10 minutes.
 FILINGS_MINUTES = float(os.environ.get("BILLTRACKER_FILINGS_MINUTES",
@@ -133,6 +136,19 @@ CREATE TABLE IF NOT EXISTS reviews (
   session TEXT NOT NULL, bill TEXT NOT NULL, priority_id TEXT NOT NULL,
   verdict TEXT, keywords TEXT DEFAULT '[]', at TEXT,
   PRIMARY KEY (session, bill, priority_id));
+CREATE TABLE IF NOT EXISTS meetings (
+  key TEXT PRIMARY KEY, chamber TEXT, harmony_id INTEGER, title TEXT, committee TEXT, location TEXT,
+  status TEXT, start TEXT, time_text TEXT, page_url TEXT, agenda_url TEXT, handouts TEXT DEFAULT '[]',
+  bills TEXT DEFAULT '[]', removed TEXT DEFAULT '[]', details_at TEXT, agenda_read_url TEXT,
+  first_seen TEXT, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS deadlines (date TEXT NOT NULL, label TEXT NOT NULL, PRIMARY KEY (date, label));
+CREATE TABLE IF NOT EXISTS press (
+  url TEXT PRIMARY KEY, source TEXT, title TEXT, published TEXT, text TEXT,
+  bills TEXT DEFAULT '[]', priorities TEXT DEFAULT '[]', first_seen TEXT, alerted INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS hearing_alerts (
+  session TEXT NOT NULL, bill TEXT NOT NULL, meeting TEXT NOT NULL, at TEXT, PRIMARY KEY (session, bill, meeting));
+CREATE TABLE IF NOT EXISTS push_subs (
+  endpoint TEXT PRIMARY KEY, sub TEXT NOT NULL, label TEXT, prefs TEXT, created TEXT, last_ok TEXT, fails INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
@@ -248,6 +264,8 @@ def settings() -> dict:
         "checkin_backup": s.get("checkin_backup", True),
         "movement_enabled": s.get("movement_enabled", True),
         "movement_categories": s.get("movement_categories", ok.DEFAULT_MOVEMENT_CATEGORIES),
+        "hearing_email": s.get("hearing_email", True),
+        "press_email": s.get("press_email", "tracked"),  # tracked | agenda | off
     }
 
 
@@ -456,6 +474,8 @@ def send_alerts(only: tuple[str, str] | None = None) -> dict:
                 log_event("alert_email", False, str(e), bill=bill)
                 return {"sent": sent, "error": str(e)}
             log_event("alert_email", True, bill=bill)
+            send_push("newbill", f"New {ov.policy_areas(item)[0] if ov.policy_areas(item) else 'OneVoice'} bill: {item['display']}",
+                      (item.get("summary") or item["title"])[:180], f"/#bill-{session}-{bill}", tag=f"new-{bill}")
             with db() as c:
                 c.execute("UPDATE matches SET alert='sent', alerted_at=? WHERE alert='pending' AND session=? AND bill=?",
                           (now_iso(), session, bill))
@@ -633,6 +653,7 @@ def send_movement_emails() -> dict:
         with db() as c:
             c.executemany("UPDATE updates SET emailed=1 WHERE id=?", [(r["id"],) for r, _ in items])
         log_event("movement_email", True, bill=bill)
+        send_push("moved", f"{item['display']} moved", item["actions"][-1]["action"][:180], f"/#bill-{session}-{bill}", tag=f"moved-{bill}")
         sent += 1
     return {"sent": sent}
 
@@ -878,7 +899,11 @@ def scheduler() -> None:
                     start_job("filings", s, lambda p, s=s: check_filings(s, p))
                     break
             else:
-                if _due("last_auto_refresh", REFRESH_HOURS):
+                if _due("calendar", CALENDAR_MINUTES / 60):
+                    start_job("calendar", None, refresh_calendar)
+                elif _due("press", PRESS_MINUTES / 60):
+                    start_job("press", None, refresh_press)
+                elif _due("last_auto_refresh", REFRESH_HOURS):
                     if start_job("refresh", None, lambda p: refresh_tracked(None, p)):
                         meta_set("last_auto_refresh", now_iso())
                 elif _due(f"indexed:{DEFAULT_SESSION}", INDEX_HOURS):
@@ -889,6 +914,261 @@ def scheduler() -> None:
                     start_job("texts", DEFAULT_SESSION, lambda p: fetch_texts(DEFAULT_SESSION, p))
         except Exception:  # noqa: BLE001 - keep the scheduler alive
             pass
+
+
+# ------------------------------------------------------- push notifications
+
+
+def vapid_signer():
+    """The signing key as the push library wants it (RFC 8292 "vapid" scheme, which Apple requires)."""
+    from py_vapid import Vapid02
+    return Vapid02.from_pem(vapid()[0].encode())
+
+
+def vapid() -> tuple[str, str]:
+    """(private key PEM, public key for browsers). Made once and kept in the database."""
+    keys = meta_get("vapid")
+    if not keys:
+        import base64 as b64
+        from cryptography.hazmat.primitives import serialization
+        from py_vapid import Vapid01
+        v = Vapid01()
+        v.generate_keys()
+        pub = v.public_key.public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+        keys = {"private": v.private_pem().decode(), "public": b64.urlsafe_b64encode(pub).decode().rstrip("=")}
+        meta_set("vapid", keys)
+    return keys["private"], keys["public"]
+
+
+PUSH_KINDS = {"newbill": "New OneVoice bills", "moved": "Tracked bill moves", "hearing": "Tracked bill on a committee agenda",
+              "press": "Press releases about your bills"}
+
+
+def send_push(kind: str, title: str, body: str, url: str = "/", tag: str = "") -> int:
+    """Notify every phone or computer that turned on notifications for this kind."""
+    try:
+        from pywebpush import WebPushException, webpush
+    except ImportError:
+        return 0
+    with db() as c:
+        subs = c.execute("SELECT endpoint, sub, prefs FROM push_subs").fetchall()
+    if not subs:
+        return 0
+    signer = vapid_signer()
+    st = settings()
+    contact = st["app_url"] if (st["app_url"] or "").startswith("https://") else "mailto:" + (ov.smtp_settings()["sender"] or "alerts@example.org")
+    payload = json.dumps({"title": title, "body": body, "url": url, "tag": tag or kind})
+    sent = 0
+    for r in subs:
+        prefs = json.loads(r["prefs"] or "{}")
+        if not prefs.get(kind, True):
+            continue
+        try:
+            webpush(json.loads(r["sub"]), payload, vapid_private_key=signer, vapid_claims={"sub": contact}, ttl=86400, timeout=15)
+            sent += 1
+            with db() as c:
+                c.execute("UPDATE push_subs SET last_ok=?, fails=0 WHERE endpoint=?", (now_iso(), r["endpoint"]))
+        except WebPushException as e:
+            code = getattr(e.response, "status_code", 0) if getattr(e, "response", None) is not None else 0
+            with db() as c:
+                if code in (404, 410):  # the browser unsubscribed or the phone was reset
+                    c.execute("DELETE FROM push_subs WHERE endpoint=?", (r["endpoint"],))
+                else:
+                    c.execute("UPDATE push_subs SET fails=fails+1 WHERE endpoint=?", (r["endpoint"],))
+            log_event("push", False, str(e)[:200], push_kind=kind)
+        except Exception as e:  # noqa: BLE001 - one bad device never stops the others
+            log_event("push", False, str(e)[:200], push_kind=kind)
+    if sent:
+        log_event("push", True, push_kind=kind, sent=sent)
+    return sent
+
+
+# ------------------------------------------------------- committee calendar
+
+
+def refresh_calendar(progress=None) -> dict:
+    """Read upcoming committee meetings for both chambers, their agendas, and the bills on them."""
+    found, errors, now = 0, [], now_iso()
+    for chamber in so.CHAMBERS:
+        try:
+            meetings = so.upcoming_meetings(chamber)
+        except Exception as e:  # noqa: BLE001 - one chamber's site being down doesn't stop the other
+            errors.append(f"{chamber}: {e}")
+            continue
+        for i, m in enumerate(meetings, 1):
+            if progress:
+                progress(i, len(meetings), f"{chamber} {m['committee']}")
+            found += 1
+            with db() as c:
+                prev = c.execute("SELECT * FROM meetings WHERE key=?", (m["key"],)).fetchone()
+                c.execute(
+                    """INSERT INTO meetings(key,chamber,harmony_id,title,committee,location,status,start,time_text,page_url,first_seen,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(key) DO UPDATE SET title=excluded.title, committee=excluded.committee,
+                         location=excluded.location, status=excluded.status, start=COALESCE(excluded.start, meetings.start),
+                         time_text=excluded.time_text, page_url=excluded.page_url, updated_at=excluded.updated_at""",
+                    (m["key"], chamber, m["harmony_id"], m["title"], m["committee"], m["location"], m["status"],
+                     m["start"], m["time_text"], m["page_url"], now, now))
+            stale = not prev or prev["title"] != m["title"] or not prev["agenda_url"] or not prev["details_at"] or \
+                datetime.now(timezone.utc) - datetime.fromisoformat(prev["details_at"]) > timedelta(hours=2)
+            if not stale:
+                continue
+            try:
+                d = so.meeting_details(m["page_url"])
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{m['key']}: {e}")
+                continue
+            with db() as c:
+                c.execute("UPDATE meetings SET handouts=?, agenda_url=?, start=COALESCE(?, start), details_at=? WHERE key=?",
+                          (json.dumps(d["handouts"]), d["agenda_url"], d["start"], now_iso(), m["key"]))
+                read_url = c.execute("SELECT agenda_read_url FROM meetings WHERE key=?", (m["key"],)).fetchone()["agenda_read_url"]
+            if d["agenda_url"] and (d["agenda_url"] != read_url or (prev and prev["title"] != m["title"])):
+                try:
+                    bills, removed = so.agenda_bills(sm.bill_text(d["agenda_url"]))
+                    with db() as c:
+                        c.execute("UPDATE meetings SET bills=?, removed=?, agenda_read_url=? WHERE key=?",
+                                  (json.dumps(bills), json.dumps(removed), d["agenda_url"], m["key"]))
+                except Exception as e:  # noqa: BLE001
+                    errors.append(f"agenda {m['key']}: {e}")
+    if _due("deadlines_at", 24):
+        try:
+            dl = so.legislative_deadlines()
+            if dl:
+                with db() as c:
+                    c.executemany("INSERT OR IGNORE INTO deadlines(date,label) VALUES(?,?)", [(x["date"], x["label"]) for x in dl])
+                meta_set("deadlines_at", now_iso())
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"deadlines: {e}")
+    alerts = send_hearing_alerts()
+    ok_ = len(errors) < 2
+    meta_set("calendar", {"at": now_iso(), "meetings": found, "errors": errors[:5]})
+    log_event("calendar", ok_, "; ".join(errors[:2]), meetings=found, alerts=alerts)
+    return {"meetings": found, "hearing_alerts": alerts, "errors": len(errors)}
+
+
+def watched_bills(session: str) -> dict[str, str]:
+    """Bills whose hearings matter: tracked ones, and agenda matches marked Relevant. {bill: why}"""
+    with db() as c:
+        out = {r["bill"]: "tracked" for r in c.execute("SELECT bill FROM tracked WHERE session=?", (session,))}
+        for r in c.execute("SELECT DISTINCT bill FROM reviews WHERE session=? AND verdict='relevant'", (session,)):
+            out.setdefault(r["bill"], "relevant")
+    return out
+
+
+def send_hearing_alerts() -> int:
+    """Email (and notify) when a tracked or Relevant bill is put on an upcoming committee agenda."""
+    session = DEFAULT_SESSION
+    watch = watched_bills(session)
+    if not watch:
+        return 0
+    st = settings()
+    sent = 0
+    with db() as c:
+        meetings = c.execute("SELECT * FROM meetings WHERE start >= ? ORDER BY start",
+                             (datetime.now(CENTRAL).replace(tzinfo=None).isoformat(),)).fetchall()
+    for m in meetings:
+        hits = [b for b in json.loads(m["bills"] or "[]") if b in watch]
+        with db() as c:
+            done = {r["bill"] for r in c.execute("SELECT bill FROM hearing_alerts WHERE session=? AND meeting=?", (session, m["key"]))}
+        new = [b for b in hits if b not in done]
+        if not new:
+            continue
+        items = []
+        with db() as c:
+            for b in new:
+                r = c.execute("""SELECT b.title, b.author, t.position FROM bills b LEFT JOIN tracked t ON t.session=b.session AND t.bill=b.bill
+                                 WHERE b.session=? AND b.bill=?""", (session, b)).fetchone()
+                items.append({"display": ok.display_bill(b), "title": (r["title"] if r else "") or "", "author": (r["author"] if r else "") or "",
+                              "position": (r["position"] if r else "") or "", "url": ok.bill_url(b, session)})
+        when = datetime.fromisoformat(m["start"]).strftime("%a, %b %-d at %-I:%M %p") if m["start"] else m["time_text"]
+        meeting = {"chamber": m["chamber"], "committee": m["committee"], "when": when, "location": m["location"],
+                   "agenda_url": m["agenda_url"], "page_url": m["page_url"], "status": m["status"]}
+        delivered = False
+        if st["hearing_email"]:
+            delivered = _try_send(st, *ov.render_hearing(items, meeting, st["app_url"]))
+        pushed = send_push("hearing", f"{', '.join(i['display'] for i in items)} on {m['chamber']} {m['committee']} agenda",
+                           f"{when} · {m['location']}", "/#calendar", tag=f"hearing-{m['key']}")
+        if delivered or pushed or not st["hearing_email"]:
+            with db() as c:
+                c.executemany("INSERT OR IGNORE INTO hearing_alerts(session,bill,meeting,at) VALUES(?,?,?,?)",
+                              [(session, b, m["key"], now_iso()) for b in new])
+            sent += 1
+    return sent
+
+
+# ---------------------------------------------------------- press releases
+
+
+def press_sources() -> list[dict]:
+    return so.BUILTIN_PRESS + (meta_get("press_sources_custom") or [])
+
+
+def refresh_press(progress=None) -> dict:
+    """Collect new press releases, tag them with bills and agenda priorities, and alert on your bills."""
+    srcs = press_sources()
+    priorities = get_priorities()
+    new_total, errors = 0, []
+    for i, src in enumerate(srcs, 1):
+        if progress:
+            progress(i, len(srcs), src["name"])
+        try:
+            items = so.fetch_press(src)
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"{src['name']}: {e}")
+            continue
+        first_run = not meta_get(f"press_seen:{src['id']}")
+        fetched_text = 0
+        for it in items:
+            with db() as c:
+                if c.execute("SELECT 1 FROM press WHERE url=?", (it["url"],)).fetchone():
+                    continue
+            text = it.get("text") or ""
+            if len(text) < 300 and fetched_text < 10 and not first_run:
+                try:
+                    text = so.press_text(it["url"])
+                    fetched_text += 1
+                except Exception:  # noqa: BLE001
+                    pass
+            bills = so.bills_in(f"{it['title']} {text}")
+            pr = ov.match_bill(it["title"], [], priorities, text, min_hits=3)
+            with db() as c:
+                c.execute("INSERT OR IGNORE INTO press(url,source,title,published,text,bills,priorities,first_seen,alerted) VALUES(?,?,?,?,?,?,?,?,?)",
+                          (it["url"], it["source"], it["title"], it["published"], text[:20000], json.dumps(bills),
+                           json.dumps([{"id": pid, "keywords": kw} for pid, kw in pr]), now_iso(), 2 if first_run else 0))
+            new_total += 0 if first_run else 1
+        meta_set(f"press_seen:{src['id']}", now_iso())
+    alerts = send_press_alerts()
+    meta_set("press", {"at": now_iso(), "new": new_total, "errors": errors[:5]})
+    log_event("press", len(errors) < len(srcs), "; ".join(errors[:2]), new=new_total, alerts=alerts)
+    return {"new": new_total, "alerts": alerts, "errors": len(errors)}
+
+
+def send_press_alerts() -> int:
+    st = settings()
+    watch = watched_bills(DEFAULT_SESSION)
+    pri = {p["id"]: p for p in get_priorities()}
+    with db() as c:
+        rows = c.execute("SELECT * FROM press WHERE alerted=0 ORDER BY published").fetchall()
+    sent = 0
+    for r in rows:
+        bills = [b for b in json.loads(r["bills"] or "[]") if b in watch]
+        prs = [p for p in json.loads(r["priorities"] or "[]") if any("(title)" in k for k in p["keywords"])]
+        mode = st["press_email"]
+        relevant = bool(bills) or (mode == "agenda" and prs)
+        delivered = False
+        if relevant and mode != "off":
+            item = {"source": r["source"], "title": r["title"], "url": r["url"], "published": r["published"],
+                    "excerpt": (r["text"] or "")[:400], "bills": [ok.display_bill(b) for b in bills],
+                    "priorities": [f"{pri[p['id']]['task_force']} #{pri[p['id']]['number']}" for p in prs if p["id"] in pri]}
+            delivered = _try_send(st, *ov.render_press(item, st["app_url"]))
+        if bills or prs:
+            send_push("press", f"{r['source']}: {r['title'][:90]}",
+                      ("Mentions " + ", ".join(ok.display_bill(b) for b in bills)) if bills else "Related to the OneVoice agenda",
+                      "/#press", tag="press-" + str(abs(hash(r["url"])) % 10**8))
+        with db() as c:
+            c.execute("UPDATE press SET alerted=1 WHERE url=?", (r["url"],))
+        sent += int(delivered)
+    return sent
 
 
 # ------------------------------------------------- health, check-in, backups
@@ -993,7 +1273,8 @@ def export_backup() -> dict:
     return {"app": "OneVoice Tracker", "format": 1, "exported_at": now_iso(),
             "tracked": tracked, "reviews": reviews, "priorities": get_priorities(),
             "settings": {k: st[k] for k in ("recipients", "alerts_enabled", "app_url", "checkin_enabled",
-                                             "checkin_backup", "movement_enabled", "movement_categories")}}
+                                             "checkin_backup", "movement_enabled", "movement_categories",
+                                             "hearing_email", "press_email")}}
 
 
 def restore_backup(data: dict) -> dict:
@@ -1058,6 +1339,8 @@ def checkin_stats() -> dict:
         ("New bills matching the agenda", total("filings", "new_matches")),
         ("New-bill alerts emailed", n("alert_email", 1)),
         ("Tracked-bill updates emailed", n("movement_email", 1)),
+        ("Committee agenda alerts", total("calendar", "alerts")),
+        ("New press releases", total("press", "new")),
         ("Bills you're tracking", tracked),
     ]
     if problems_info:
@@ -1277,8 +1560,8 @@ def security_headers(resp):
 def require_sign_in():
     if not app.secret_key:
         app.secret_key = _secret_key()
-    if request.path in ("/login", "/healthz") or request.path.startswith("/r/"):
-        return None  # /r/ links carry their own signature
+    if request.path in ("/login", "/healthz", "/sw.js", "/manifest.webmanifest") or request.path.startswith(("/r/", "/static/icons/")):
+        return None  # /r/ links carry their own signature; app files hold nothing private
     if not PASSWORD:
         required = os.environ.get("BILLTRACKER_REQUIRE_PASSWORD", "false") == "true"
         if not required and os.environ.get("HOST", "127.0.0.1") in ("127.0.0.1", "localhost"):
@@ -1721,6 +2004,237 @@ def api_newbills():
     return jsonify(total=total, results=out)
 
 
+# ------------------------------------------------------- phone app (PWA)
+
+
+@app.get("/manifest.webmanifest")
+def manifest():
+    data = {
+        "name": "OneVoice Tracker", "short_name": "OneVoice", "start_url": "/#home", "scope": "/",
+        "display": "standalone", "background_color": "#33393a", "theme_color": "#33393a",
+        "description": "Oklahoma bills, committee meetings and press releases for the OneVoice agenda.",
+        "icons": [{"src": "/static/icons/icon-192.png", "sizes": "192x192", "type": "image/png"},
+                  {"src": "/static/icons/icon-512.png", "sizes": "512x512", "type": "image/png"},
+                  {"src": "/static/icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"}],
+    }
+    return Response(json.dumps(data), mimetype="application/manifest+json")
+
+
+@app.get("/sw.js")
+def service_worker():
+    resp = send_from_directory(app.static_folder, "sw.js", mimetype="text/javascript")
+    resp.headers["Service-Worker-Allowed"] = "/"
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/api/push/key")
+def api_push_key():
+    return jsonify(key=vapid()[1], kinds=PUSH_KINDS)
+
+
+@app.post("/api/push/subscribe")
+def api_push_subscribe():
+    body = request.get_json(force=True) or {}
+    sub = body.get("subscription") or {}
+    if not sub.get("endpoint") or not (sub.get("keys") or {}).get("p256dh"):
+        abort(400, "That browser didn't provide a notification subscription.")
+    prefs = {k: bool((body.get("prefs") or {}).get(k, True)) for k in PUSH_KINDS}
+    with db() as c:
+        c.execute("INSERT OR REPLACE INTO push_subs(endpoint,sub,label,prefs,created,last_ok,fails) VALUES(?,?,?,?,?,NULL,0)",
+                  (sub["endpoint"], json.dumps(sub), str(body.get("label") or "")[:80], json.dumps(prefs), now_iso()))
+    return jsonify(ok=True, prefs=prefs)
+
+
+@app.post("/api/push/prefs")
+def api_push_prefs():
+    body = request.get_json(force=True) or {}
+    prefs = {k: bool((body.get("prefs") or {}).get(k, True)) for k in PUSH_KINDS}
+    with db() as c:
+        cur = c.execute("UPDATE push_subs SET prefs=? WHERE endpoint=?", (json.dumps(prefs), body.get("endpoint", "")))
+    if not cur.rowcount:
+        abort(404, "Notifications aren't turned on for this device.")
+    return jsonify(ok=True, prefs=prefs)
+
+
+@app.post("/api/push/status")
+def api_push_status():
+    body = request.get_json(force=True) or {}
+    with db() as c:
+        r = c.execute("SELECT prefs FROM push_subs WHERE endpoint=?", (body.get("endpoint", ""),)).fetchone()
+        n = c.execute("SELECT COUNT(*) n FROM push_subs").fetchone()["n"]
+    return jsonify(subscribed=bool(r), prefs=json.loads(r["prefs"]) if r else None, devices=n)
+
+
+@app.post("/api/push/unsubscribe")
+def api_push_unsubscribe():
+    body = request.get_json(force=True) or {}
+    with db() as c:
+        c.execute("DELETE FROM push_subs WHERE endpoint=?", (body.get("endpoint", ""),))
+    return jsonify(ok=True)
+
+
+@app.post("/api/push/test")
+def api_push_test():
+    body = request.get_json(force=True) or {}
+    with db() as c:
+        r = c.execute("SELECT sub FROM push_subs WHERE endpoint=?", (body.get("endpoint", ""),)).fetchone()
+    if not r:
+        abort(404, "Notifications aren't turned on for this device.")
+    try:
+        from pywebpush import webpush
+        st = settings()
+        contact = st["app_url"] if (st["app_url"] or "").startswith("https://") else "mailto:alerts@example.org"
+        webpush(json.loads(r["sub"]), json.dumps({"title": "OneVoice Tracker", "body": "Notifications are working on this device.",
+                                                  "url": "/#home", "tag": "test"}),
+                vapid_private_key=vapid_signer(), vapid_claims={"sub": contact}, ttl=600, timeout=15)
+    except Exception as e:  # noqa: BLE001
+        return jsonify(error=f"The test notification couldn't be sent: {e}"), 400
+    return jsonify(ok=True)
+
+
+# ------------------------------------------------- home, calendar, press APIs
+
+
+@app.get("/api/home")
+def api_home():
+    s = want_session()
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    now_local = datetime.now(CENTRAL).replace(tzinfo=None)
+    monday = (now_local - timedelta(days=now_local.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    with db() as c:
+        new_bills = c.execute("""SELECT COUNT(DISTINCT m.bill) n FROM matches m JOIN bills b ON b.session=m.session AND b.bill=m.bill
+                                 LEFT JOIN reviews rv ON rv.session=m.session AND rv.bill=m.bill AND rv.priority_id=m.priority_id
+                                 WHERE m.session=? AND b.first_seen>=? AND COALESCE(rv.verdict,'')!='not_relevant'""", (s, week_ago)).fetchone()["n"]
+        to_review = c.execute("""SELECT COUNT(DISTINCT m.bill) n FROM matches m LEFT JOIN reviews rv
+                                 ON rv.session=m.session AND rv.bill=m.bill AND rv.priority_id=m.priority_id
+                                 WHERE m.session=? AND m.alert IN ('pending','sent') AND rv.verdict IS NULL""", (s,)).fetchone()["n"]
+        meetings = c.execute("SELECT COUNT(*) n FROM meetings WHERE start>=? AND start<?",
+                             (monday.isoformat(), (monday + timedelta(days=7)).isoformat())).fetchone()["n"]
+        press_new = c.execute("SELECT COUNT(*) n FROM press WHERE first_seen>=? AND alerted!=2", (week_ago,)).fetchone()["n"]
+        tracked = c.execute("SELECT COUNT(*) n FROM tracked WHERE session=?", (s,)).fetchone()["n"]
+        upcoming = [dict(r) for r in c.execute(
+            "SELECT key, chamber, committee, start, time_text, location, bills FROM meetings WHERE start>=? ORDER BY start LIMIT 40",
+            (now_local.isoformat(),))]
+        unseen_updates = c.execute("SELECT COUNT(*) n FROM updates WHERE session=? AND seen=0", (s,)).fetchone()["n"]
+    watch = watched_bills(s)
+    mine = [m for m in upcoming if any(b in watch for b in json.loads(m["bills"] or "[]"))][:3]
+    for m in mine:
+        m["your_bills"] = [ok.display_bill(b) for b in json.loads(m["bills"]) if b in watch]
+        m.pop("bills")
+    return jsonify(new_bills=new_bills, to_review=to_review, meetings_this_week=meetings, press_new=press_new,
+                   tracked=tracked, updates=unseen_updates, your_hearings=mine)
+
+
+@app.get("/api/calendar")
+def api_calendar():
+    """One week of committee meetings (Monday to Sunday) with agendas and the bills on them."""
+    s = want_session()
+    try:
+        start = datetime.fromisoformat(request.args.get("week") or "")
+    except ValueError:
+        today = datetime.now(CENTRAL).replace(tzinfo=None)
+        start = today - timedelta(days=today.weekday())
+    start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=7)
+    watch = watched_bills(s)
+    with db() as c:
+        rows = [dict(r) for r in c.execute("SELECT * FROM meetings WHERE start>=? AND start<? ORDER BY start",
+                                           (start.isoformat(), end.isoformat()))]
+        dls = [dict(r) for r in c.execute("SELECT date, label FROM deadlines WHERE date>=? AND date<? ORDER BY date",
+                                          (start.date().isoformat(), end.date().isoformat()))]
+        matched = {r["bill"] for r in c.execute(
+            """SELECT DISTINCT m.bill FROM matches m LEFT JOIN reviews rv ON rv.session=m.session AND rv.bill=m.bill
+               AND rv.priority_id=m.priority_id WHERE m.session=? AND COALESCE(rv.verdict,'')!='not_relevant'""", (s,))}
+        titles = {}
+        allb = sorted({b for r in rows for b in json.loads(r["bills"] or "[]")})
+        for i in range(0, len(allb), 500):
+            chunk = allb[i:i + 500]
+            for r in c.execute(f"SELECT bill, title FROM bills WHERE session=? AND bill IN ({','.join('?' * len(chunk))})", [s] + chunk):
+                titles[r["bill"]] = r["title"]
+    for r in rows:
+        r["bills"] = [{"bill": b, "display": ok.display_bill(b), "title": titles.get(b, ""),
+                       "watch": watch.get(b), "onevoice": b in matched} for b in json.loads(r["bills"] or "[]")]
+        r["removed"] = [ok.display_bill(b) for b in json.loads(r["removed"] or "[]")]
+        r.pop("handouts", None)
+    return jsonify(week=start.date().isoformat(), meetings=rows, deadlines=dls, updated=(meta_get("calendar") or {}).get("at"))
+
+
+@app.get("/api/press")
+def api_press():
+    s = want_session()
+    source, show, q = request.args.get("source") or "", request.args.get("show") or "", (request.args.get("q") or "").strip()
+    limit, offset = min(int(request.args.get("limit", 30)), 100), max(int(request.args.get("offset", 0)), 0)
+    where, args = ["1=1"], []
+    if source:
+        where.append("source=?"); args.append(source)
+    if q:
+        for w in q.split():
+            where.append("(title LIKE ? OR text LIKE ?)"); args += [f"%{w}%", f"%{w}%"]
+    if show == "agenda":
+        where.append("(priorities!='[]' OR bills!='[]')")
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            f"SELECT url, source, title, published, substr(text,1,400) AS excerpt, bills, priorities, first_seen FROM press "
+            f"WHERE {' AND '.join(where)} ORDER BY COALESCE(published, first_seen) DESC", args)]
+    watch = watched_bills(s)
+    pri = {p["id"]: p for p in get_priorities()}
+    out = []
+    for r in rows:
+        bills = json.loads(r["bills"] or "[]")
+        prs = json.loads(r["priorities"] or "[]")
+        r["bills"] = [{"bill": b, "display": ok.display_bill(b), "watch": watch.get(b)} for b in bills]
+        r["priorities"] = [{"id": p["id"], "label": f"{pri[p['id']]['task_force']} #{pri[p['id']]['number']}"} for p in prs if p["id"] in pri]
+        if show == "mine" and not any(b["watch"] for b in r["bills"]):
+            continue
+        out.append(r)
+    sources = sorted({x["name"] for x in press_sources()})
+    return jsonify(total=len(out), results=out[offset:offset + limit], sources=sources, updated=(meta_get("press") or {}).get("at"))
+
+
+@app.post("/api/press/sources")
+def api_press_add_source():
+    body = request.get_json(force=True) or {}
+    url, name = (body.get("url") or "").strip(), (body.get("name") or "").strip()[:60]
+    if not re.match(r"^https://(www\.)?oklahoma\.gov/.+", url):
+        abort(400, "Paste the link to an oklahoma.gov newsroom page, like https://oklahoma.gov/ohca/about/newsroom.html")
+    try:
+        items = so.aem_newsroom(url, name or "Agency")
+    except Exception as e:  # noqa: BLE001
+        abort(400, f"That page doesn't have a news list the tracker can read ({e}).")
+    custom = meta_get("press_sources_custom") or []
+    sid = "c" + str(abs(hash(url)) % 10**8)
+    if not any(x["url"] == url for x in custom):
+        custom.append({"id": sid, "name": name or url.split("/")[3].upper(), "kind": "aem", "url": url})
+        meta_set("press_sources_custom", custom)
+    return jsonify(ok=True, found=len(items), sources=press_sources())
+
+
+@app.delete("/api/press/sources/<sid>")
+def api_press_remove_source(sid):
+    meta_set("press_sources_custom", [x for x in (meta_get("press_sources_custom") or []) if x["id"] != sid])
+    return jsonify(ok=True, sources=press_sources())
+
+
+@app.get("/api/press/sources")
+def api_press_list_sources():
+    return jsonify(sources=press_sources())
+
+
+@app.post("/api/calendar/refresh")
+def api_calendar_refresh():
+    if not start_job("calendar", None, refresh_calendar):
+        return jsonify(error=BUSY), 409
+    return jsonify(ok=True)
+
+
+@app.post("/api/press/refresh")
+def api_press_refresh():
+    if not start_job("press", None, refresh_press):
+        return jsonify(error=BUSY), 409
+    return jsonify(ok=True)
+
+
 # ---------------------------------------------------------------- agenda API
 
 
@@ -1914,8 +2428,18 @@ def api_health():
                "last_error": err["error"] if err else None, "last_error_at": local(err["at"]) if err else None},
         checkin={"at": local(checkin.get("at")), "sent": checkin.get("sent"), "hour": CHECKIN_HOUR},
         backup={"at": local(backup.get("at")), "file": backup.get("file")},
+        calendar={"at": local((meta_get("calendar") or {}).get("at")), "errors": (meta_get("calendar") or {}).get("errors", []),
+                  "every_minutes": CALENDAR_MINUTES},
+        press={"at": local((meta_get("press") or {}).get("at")), "errors": (meta_get("press") or {}).get("errors", []),
+               "every_minutes": PRESS_MINUTES},
+        push_devices=_count("push_subs"),
         refresh_hours=REFRESH_HOURS,
     )
+
+
+def _count(table: str) -> int:
+    with db() as c:
+        return c.execute(f"SELECT COUNT(*) n FROM {table}").fetchone()["n"]
 
 
 @app.get("/api/backup.json")
@@ -1967,7 +2491,9 @@ def api_settings_update():
         s["alerts_enabled"] = bool(body["alerts_enabled"])
     if "app_url" in body:
         s["app_url"] = str(body["app_url"]).strip()[:300]
-    for key in ("checkin_enabled", "checkin_backup", "movement_enabled"):
+    if body.get("press_email") in ("tracked", "agenda", "off"):
+        s["press_email"] = body["press_email"]
+    for key in ("checkin_enabled", "checkin_backup", "movement_enabled", "hearing_email"):
         if key in body:
             s[key] = bool(body[key])
     if "movement_categories" in body:

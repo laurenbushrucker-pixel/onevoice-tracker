@@ -387,3 +387,58 @@ def render_problem(title: str, message: str, fix: str, resolved: bool, app_url: 
         + (f'<p style="font-size:14px;color:#3d4a3a;margin:0 0 12px"><b>What to do:</b> {e(fix)}</p>' if fix and not resolved else "")
         + f'<div>{_button(app_url, "Open OneVoice Tracker")}</div>' + _FOOT + _WRAP_END)
     return subject, text, html_body
+
+
+def render_hearing(items: list[dict], meeting: dict, app_url: str) -> tuple[str, str, str]:
+    """Tracked or Relevant bills put on a committee agenda.
+    items: [{display, title, author, position, url}]; meeting: {chamber, committee, when, location, agenda_url, page_url, status}"""
+    e = html.escape
+    names = ", ".join(i["display"] for i in items)
+    subject = f"OneVoice Tracker: {names} on {meeting['chamber']} {meeting['committee']} agenda {meeting['when']}"
+    lines = [f"{names} {'is' if len(items) == 1 else 'are'} on the agenda:", "",
+             f"{meeting['chamber']} {meeting['committee']}", f"{meeting['when']}" + (f", {meeting['location']}" if meeting.get("location") else ""), ""]
+    for i in items:
+        lines.append(f"{i['display']}" + (f" by {i['author']}" if i.get("author") else "") + f": {i['title']}"
+                     + (f" (Chamber position: {i['position'].capitalize()})" if i.get("position") else ""))
+    if meeting.get("agenda_url"):
+        lines += ["", f"Agenda: {meeting['agenda_url']}"]
+    if meeting.get("page_url"):
+        lines.append(f"Watch or follow: {meeting['page_url']}")
+    lines += ["", "You are getting this because you track these bills or marked them Relevant in OneVoice Tracker."]
+    rows = "".join(
+        f'<tr><td style="padding:8px 0;border-bottom:1px solid #e3e7df"><a href="{e(i["url"])}" style="font:700 15px Menlo,Consolas,monospace;color:#2f3a2c;text-decoration:none">{e(i["display"])}</a>'
+        + (f' <span style="font-size:13px;color:#707a6c">by {e(i["author"])}</span>' if i.get("author") else "")
+        + (f' <span style="font-size:12px;font-weight:700;color:#4f8a1e;text-transform:uppercase">{e(i["position"])}</span>' if i.get("position") else "")
+        + f'<div style="font-size:14px;color:#1d241b">{e(i["title"])}</div></td></tr>' for i in items)
+    html_body = (_WRAP_TOP.format(color="#5a9a28") +
+        f'<h1 style="font-size:21px;color:#1d241b;margin:6px 0 4px">On the agenda: {e(names)}</h1>'
+        f'<p style="font-size:16px;color:#1d241b;margin:8px 0 2px"><b>{e(meeting["chamber"])} {e(meeting["committee"])}</b></p>'
+        f'<p style="font-size:15px;color:#3d4a3a;margin:0 0 12px">{e(meeting["when"])}' + (f' &middot; {e(meeting["location"])}' if meeting.get("location") else "") + '</p>'
+        f'<table role="presentation" width="100%" style="border-collapse:collapse;border-top:1px solid #e3e7df">{rows}</table>'
+        f'<div style="margin-top:16px">{_button(meeting.get("agenda_url", ""), "Open the agenda")}{_button(meeting.get("page_url", ""), "Watch or follow", False)}'
+        f'{_button(app_url + "#calendar" if app_url else "", "Calendar", False)}</div>'
+        '<p style="color:#8a9386;font-size:12px;margin-top:18px">You are getting this because you track these bills or marked them Relevant in OneVoice Tracker.</p>' + _WRAP_END)
+    return subject, "\n".join(lines), html_body
+
+
+def render_press(item: dict, app_url: str) -> tuple[str, str, str]:
+    """A press release that mentions tracked bills or an agenda priority.
+    item: {source, title, url, published, excerpt, bills: [display], priorities: [label]}"""
+    e = html.escape
+    about = ", ".join(item["bills"]) if item["bills"] else ", ".join(item["priorities"])
+    subject = f"OneVoice Tracker: {item['source']} press release mentions {about}"[:200]
+    lines = [f"{item['source']} press release: {item['title']}", item["url"], ""]
+    if item["bills"]:
+        lines.append("Mentions: " + ", ".join(item["bills"]))
+    if item["priorities"]:
+        lines.append("Related to: " + ", ".join(item["priorities"]))
+    lines += ["", item.get("excerpt", ""), "", "You are getting this because it mentions bills you follow in OneVoice Tracker."]
+    chips = "".join(f'<span style="display:inline-block;background:#e3f0d6;color:#2f5f12;font-weight:700;font-size:12px;padding:2px 8px;border-radius:4px;margin:0 4px 4px 0">{e(x)}</span>'
+                    for x in item["bills"] + item["priorities"])
+    html_body = (_WRAP_TOP.format(color="#5a9a28") +
+        f'<div style="font-size:13px;color:#5d6659;margin-top:6px">{e(item["source"])} press release</div>'
+        f'<h1 style="font-size:20px;color:#1d241b;margin:4px 0 10px"><a href="{e(item["url"])}" style="color:#1d241b;text-decoration:none">{e(item["title"])}</a></h1>'
+        f'<div>{chips}</div><p style="font-size:14px;color:#3d4a3a;line-height:1.5">{e(item.get("excerpt", ""))}…</p>'
+        f'<div style="margin-top:14px">{_button(item["url"], "Read the release")}{_button(app_url + "#press" if app_url else "", "All press releases", False)}</div>'
+        '<p style="color:#8a9386;font-size:12px;margin-top:18px">You are getting this because it mentions bills you follow in OneVoice Tracker.</p>' + _WRAP_END)
+    return subject, "\n".join(lines), html_body
