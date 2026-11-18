@@ -436,11 +436,16 @@ fieldset.group legend { font-weight: 700; font-family: var(--font-display); padd
   .tile b { font-size: 1.02rem; }
   .tile-sub { font-size: 0.8rem; }
   .tile-main { grid-column: 1 / -1; min-height: 96px; }
-  .bottom-nav { display: grid; grid-template-columns: repeat(5, 1fr); position: fixed; left: 0; right: 0; bottom: 0; z-index: 15;
+  .bottom-nav { display: grid; grid-template-columns: 1fr 1fr 1.5fr 1fr 1fr 1fr; align-items: end; position: fixed; left: 0; right: 0; bottom: 0; z-index: 15;
     background: var(--surface); border-top: 1px solid var(--line); padding: 6px max(6px, env(safe-area-inset-right, 0px)) calc(6px + env(safe-area-inset-bottom, 0px)) max(6px, env(safe-area-inset-left, 0px)); }
   .bottom-nav a { position: relative; display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 6px 0; color: var(--muted); text-decoration: none; font-size: 0.7rem; font-weight: 600; -webkit-tap-highlight-color: transparent; }
   .bottom-nav a svg { width: 24px; height: 24px; }
   .bottom-nav a[aria-current="page"] { color: var(--brand); }
+  .bottom-nav a.nav-log { padding: 0 2px; }
+  .nav-log-btn { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; width: 100%; max-width: 104px; height: 64px; margin-top: -22px;
+    background: var(--brand); color: #fff; border-radius: 18px; box-shadow: 0 6px 16px rgba(40, 70, 20, 0.35); font-size: 0.74rem; font-weight: 700; line-height: 1.1; text-align: center; }
+  .nav-log-btn svg { width: 26px; height: 26px; }
+  .bottom-nav a.nav-log:active .nav-log-btn { transform: scale(0.96); }
   .nav-dot { position: absolute; top: 4px; left: 58%; width: 9px; height: 9px; border-radius: 50%; background: var(--accent); }
   .toolbar input[type="search"] { flex-basis: 100%; font-size: 16px; }   /* 16px stops iPhone zooming in */
   input, select, textarea { font-size: 16px; }

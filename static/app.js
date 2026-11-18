@@ -553,6 +553,12 @@ function currentView() {
 }
 function route() {
   hideTip();
+  if (location.hash === "#meetings-new") {  // the big Log Meeting button: open a blank meeting form
+    history.replaceState(null, "", "#meetings");
+    route();
+    setTimeout(() => openMeetingForm(null), 120);
+    return;
+  }
   const view = currentView();
   const h = location.hash.replace("#", "");
   if (h.startsWith("bills-") && priorityById(h.slice(6))) {
