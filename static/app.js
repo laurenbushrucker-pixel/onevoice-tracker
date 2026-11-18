@@ -496,6 +496,8 @@ function bindEvents() {
     window.location.href = `/api/export.csv?session=${state.session}`;
   });
   $("#find-form").addEventListener("submit", (e) => { e.preventDefault(); runSearch(true); });
+  let findTimer;
+  $("#find-q").addEventListener("input", () => { clearTimeout(findTimer); findTimer = setTimeout(() => runSearch(true), 400); });
   $("#nb-form").addEventListener("submit", (e) => { e.preventDefault(); runNewBills(true); });
   ["#nb-priority", "#nb-review", "#nb-position"].forEach((s) => $(s).addEventListener("change", () => runNewBills(true)));
   $("#nb-more").addEventListener("click", () => runNewBills(false));
@@ -562,9 +564,16 @@ function route() {
     document.querySelectorAll(".view").forEach((v) => (v.hidden = v.id !== "view-find"));
     document.querySelectorAll(".tabs a").forEach((a) => a.setAttribute("aria-current", a.dataset.view === "find" ? "page" : "false"));
     $("#find-back").hidden = false;
+    state.findFromAgenda = true;
     window.scrollTo(0, 0);
     runSearch(true);
     return;
+  }
+  if (view === "find" && state.findFromAgenda) {
+    // Bill Search itself always starts with every bill; the priority filter was only for that agenda link.
+    state.findFromAgenda = false;
+    $("#find-agenda").value = ""; $("#find-dismissed").value = ""; $("#find-sort").value = "";
+    state.find = { offset: 0, total: 0, results: [] };
   }
   $("#find-back").hidden = true;
   document.querySelectorAll(".view").forEach((v) => (v.hidden = v.id !== `view-${view}`));
@@ -1039,8 +1048,10 @@ async function runSearch(reset) {
     chamber: $("#find-chamber").value, stage: $("#find-stage").value, sort: $("#find-sort").value, offset: state.find.offset, limit: 50,
   });
   $("#find-meta").textContent = "Searching…";
+  const ticket = (state.findTicket = (state.findTicket || 0) + 1);
   try {
     const data = await api(`/api/search?${p}`);
+    if (ticket !== state.findTicket) return;  // a newer search (more typing) replaced this one
     state.find.total = data.total;
     state.find.results = state.find.results.concat(data.results);
     state.find.offset = state.find.results.length;
@@ -1057,9 +1068,11 @@ function renderResults() {
   $("#find-noindex").hidden = !(noIndex && !results.length);
   const ag = $("#find-agenda").value, p = ag && ag !== "any" ? priorityById(ag) : null;
   $("#find-dismissed").hidden = !ag;
+  const sessName = ($("#session").selectedOptions[0] || {}).textContent || "this session";
+  const filtered = q || ag || $("#find-subject").value || $("#find-chamber").value || $("#find-stage").value;
   $("#find-meta").textContent = results.length
-    ? `Showing ${results.length.toLocaleString()} of ${total.toLocaleString()} measures${p ? ` matching ${shortLabel(p)}: ${p.title}` : ag === "any" ? " matching the agenda" : ""}`
-    : noIndex ? "" : q ? `No measures match “${q}”.` : "No measures match these filters.";
+    ? `Showing ${results.length.toLocaleString()} of ${total.toLocaleString()} ${filtered ? "matching bills" : "bills"} in the ${sessName}${p ? ` · ${shortLabel(p)}: ${p.title}` : ag === "any" ? " · matching the agenda" : ""}${filtered ? "" : ". Type above to narrow the list."}`
+    : noIndex ? "" : q ? `No bills in the ${sessName} match “${q}”.` : filtered ? "No bills match these filters." : `No bills have been filed in the ${sessName} yet. They appear here within 10 minutes of being filed.`;
   const tracked = new Set(state.tracked.map((t) => t.bill));
   const closed = state.status && state.status.closed;
   $("#find-results").innerHTML = results.map((r) => `

@@ -1671,15 +1671,29 @@ def index_page():
     return send_from_directory(app.static_folder, "index.html")
 
 
+def with_legislature(code: str, name: str) -> str:
+    """'2027 Regular Session' -> '2027 Regular Session (61st Legislature)'."""
+    try:
+        n = (int(ok.session_year(code)) - 1907) // 2 + 1
+    except (TypeError, ValueError):
+        return name
+    if "Legislature" in name or n < 1:
+        return name
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{name} ({n}{suffix} Legislature)"
+
+
 @app.get("/api/config")
 def api_config():
     sessions = meta_get("sessions")
-    if not sessions:
+    if not sessions or _due("sessions_at", 24):  # re-read daily so a new session shows up
         try:
             sessions = [s.__dict__ for s in ok.fetch_sessions()]
             meta_set("sessions", sessions)
+            meta_set("sessions_at", now_iso())
         except RuntimeError:
-            sessions = [{"code": DEFAULT_SESSION, "name": f"{ok.session_year(DEFAULT_SESSION)} Regular Session"}]
+            sessions = sessions or [{"code": DEFAULT_SESSION, "name": f"{ok.session_year(DEFAULT_SESSION)} Regular Session"}]
+    sessions = [{**x, "name": with_legislature(x["code"], x["name"])} for x in sessions]
     return jsonify(
         default_session=DEFAULT_SESSION,
         alert_sessions=ALERT_SESSIONS,
