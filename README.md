@@ -106,6 +106,54 @@ progress bar.
 - Filter by agenda priority, relevance (not reviewed, relevant, not relevant)
   and position (including "No position yet").
 
+## Session scoreboard
+
+The Scoreboard screen shows the session at a glance: OneVoice bills filed, marked
+Relevant, tracked, enacted, the share of supported bills that became law, and
+wins (supported and passed, or opposed and stopped). Charts show bills by task
+force, how far OneVoice bills got, and the Chamber's positions. "Show as tables"
+gives the same numbers as tables.
+
+## Hearings in Outlook
+
+Settings › Hearings in your Outlook calendar gives a private calendar link
+(`/cal/<secret>.ics`). Subscribe to it in Outlook ("Add calendar › Subscribe from
+web"), Google Calendar or an iPhone. It lists every committee meeting with a
+OneVoice, tracked or Relevant bill (or every meeting, with the box checked),
+with the agenda link and bills, plus legislative deadlines as all-day events.
+Canceled meetings update themselves. "Make a new link" retires the old one.
+
+## What changed? (redlines)
+
+When a tracked or Relevant bill gets a new version (committee substitute,
+engrossed, enrolled), the tracker compares it word by word with the version
+before and emails a redline: words taken out struck in red, words added in
+green, and any OneVoice keywords the bill gained or lost. The bill's page in the
+app lists each change and can compare any two posted versions on demand.
+
+## Friday report for Members
+
+The Friday Report screen builds the Bill Track spreadsheet (Track, Bill
+Information, AI Summary, Last Action Date) for any week: every OneVoice and
+tracked bill with action that week, newest first, grouped by track, with links
+to each bill. Download it as Excel or email it. During session it emails itself
+every Friday at noon Central (`BILLTRACKER_REPORT_HOUR`), but only in weeks when
+bills moved. A tracked bill's track can be changed on its page (for example to
+Criminal Justice or Tax Reform); otherwise it uses the OneVoice task force.
+
+## 2027 goals and meetings
+
+The Goals screen tracks the Government Affairs goals: a scorecard of the six
+headline measures with pace markers from the quarterly targets, every
+objective under Goals 1 to 3, and a quarterly milestone checklist. Bills passed
+and tracking coverage fill in by themselves. The Meetings screen logs who met,
+the date, the office, Chamber staff, issues, bills, an overview of the
+discussion and follow-up; in-person meetings count toward the contact goals
+(each person met is one contact, and distinct names are counted separately).
+Donors and PAC activities are logged under Goals › Donors & activities.
+Targets can be edited, and "Download (Excel)" exports the scorecard and all
+logs. Set `BILLTRACKER_GOAL_YEAR` to change the default year (2027).
+
 ## Staying reliable
 
 - **Daily check-in** (7 a.m. Central, `BILLTRACKER_CHECKIN_HOUR`): an email

@@ -442,3 +442,52 @@ def render_press(item: dict, app_url: str) -> tuple[str, str, str]:
         f'<div style="margin-top:14px">{_button(item["url"], "Read the release")}{_button(app_url + "#press" if app_url else "", "All press releases", False)}</div>'
         '<p style="color:#8a9386;font-size:12px;margin-top:18px">You are getting this because it mentions bills you follow in OneVoice Tracker.</p>' + _WRAP_END)
     return subject, "\n".join(lines), html_body
+
+
+def render_redline(item: dict, app_url: str) -> tuple[str, str, str]:
+    """A tracked or Relevant bill was rewritten. item: {display, title, author, url, link, old_version,
+    new_version, headline, changes_html, changes_text, gained, lost, position}"""
+    e = html.escape
+    subject = f"OneVoice Tracker: What changed in {item['display']} ({item['new_version']})"
+    lines = [f"{item['display']} has a new version: {item['new_version']} (was: {item['old_version']}).",
+             item["headline"], ""]
+    if item.get("gained"):
+        lines.append("OneVoice keywords now in the bill: " + ", ".join(item["gained"]))
+    if item.get("lost"):
+        lines.append("OneVoice keywords no longer in the bill: " + ", ".join(item["lost"]))
+    lines += ["", item["changes_text"], "", f"Read the new version: {item['link']}", f"Bill page: {item['url']}"]
+    if app_url:
+        lines.append(f"See every version in the tracker: {app_url}#bill-{item['session']}-{item['bill']}")
+    kw = ""
+    if item.get("gained"):
+        kw += f'<p style="font-size:14px;margin:4px 0"><b style="color:#1f7a4d">Now mentions:</b> {e(", ".join(item["gained"]))}</p>'
+    if item.get("lost"):
+        kw += f'<p style="font-size:14px;margin:4px 0"><b style="color:#b3261e">No longer mentions:</b> {e(", ".join(item["lost"]))}</p>'
+    html_body = (_WRAP_TOP.format(color="#3f6fb5") +
+        f'<h1 style="font-size:21px;color:#1d241b;margin:6px 0 4px">What changed in {e(item["display"])}</h1>'
+        f'<p style="color:#4d574a;margin:0 0 6px;font-size:14px">{e(item.get("title", ""))}</p>'
+        f'<p style="font-size:14px;color:#1d241b;margin:8px 0"><b>{e(item["old_version"])}</b> &rarr; <b>{e(item["new_version"])}</b><br>'
+        f'{e(item["headline"])}</p>' + kw +
+        '<p style="font-size:12px;color:#5d6659;margin:12px 0 6px">'
+        '<span style="background:#fde8e7;color:#b3261e;text-decoration:line-through">struck red</span> = taken out &nbsp; '
+        '<span style="background:#e3f3ea;color:#1f7a4d;font-weight:600">green</span> = added</p>'
+        + item["changes_html"]
+        + f'<div style="margin-top:14px">{_button(item["link"], "Read the new version")}'
+        + (_button(f"{app_url}#bill-{item['session']}-{item['bill']}", "Open in tracker", False) if app_url else "") + '</div>'
+        + '<p style="color:#8a9386;font-size:12px;margin-top:18px">You are getting this because this bill is tracked or marked Relevant in OneVoice Tracker.</p>'
+        + _WRAP_END)
+    return subject, "\n".join(lines), html_body
+
+
+def render_weekly_report(label: str, count: int, app_url: str) -> tuple[str, str, str]:
+    e = html.escape
+    subject = f"OneVoice Tracker: Bill Track report, {label}"
+    text = (f"Attached is the Bill Track report for {label}: {count} bill{'s' if count != 1 else ''} with action this week, "
+            "grouped by track, with summaries and last action dates. It is ready to forward to Members."
+            + (f"\n\nMake a different week's report: {app_url}#report" if app_url else ""))
+    html_body = (_WRAP_TOP.format(color="#5a9a28") +
+        f'<h1 style="font-size:21px;color:#1d241b;margin:6px 0 8px">Bill Track report: {e(label)}</h1>'
+        f'<p style="font-size:15px;color:#1d241b">Attached: <b>{count}</b> bill{"s" if count != 1 else ""} with action this week, '
+        'grouped by track, with summaries and last action dates. It is ready to forward to Members.</p>'
+        + (f'<div>{_button(app_url + "#report", "Make a different week")}</div>' if app_url else "") + _WRAP_END)
+    return subject, text, html_body

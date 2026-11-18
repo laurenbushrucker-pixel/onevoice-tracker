@@ -16,7 +16,7 @@ const state = {
   drawer: null, // { session, bill, data }
   editing: null, // priority id whose keywords are open
 };
-const VIEWS = ["home", "newbills", "calendar", "press", "agenda", "mine", "find", "updates", "settings", "more"];
+const VIEWS = ["home", "newbills", "calendar", "press", "agenda", "mine", "find", "updates", "settings", "more", "scoreboard", "goals", "meetings", "report"];
 const STAGE_ORDER = ["introduced", "committee", "floor", "crossed", "passed", "governor", "law"];
 const PROGRESS_LABELS = ["Filed", "Committee", "Floor", "2nd chamber", "Passed", "Governor", "Enacted"];
 const PRIORITY_RANK = { high: 0, medium: 1, low: 2 };
@@ -210,6 +210,8 @@ async function loadHome() {
   $("#tile-cal").textContent = h.meetings_this_week ? `${h.meetings_this_week} meeting${h.meetings_this_week === 1 ? "" : "s"} this week` : "Committee meetings and agendas";
   $("#tile-press").textContent = h.press_new ? `${h.press_new} new this week` : "Senate, House, Governor, agencies";
   $("#tile-mine").textContent = h.tracked ? `${h.tracked} tracked${h.updates ? ` · ${h.updates} update${h.updates === 1 ? "" : "s"}` : ""}` : "Bills with a Chamber position";
+  if (h.goals_line) $("#tile-goals").textContent = h.goals_line;
+  if (h.meetings_logged) $("#tile-meetings").textContent = `${h.meetings_logged} logged in ${h.goal_year}`;
   $("#nav-dot-bills").hidden = !h.to_review;
   $("#home-hearings").hidden = !h.your_hearings.length;
   $("#home-hearings-list").innerHTML = h.your_hearings.map((m) => `
@@ -524,6 +526,7 @@ function bindEvents() {
   });
   $("#s-test").addEventListener("click", testEmail);
   $("#agenda-reset").addEventListener("click", confirmReset);
+  bindNewFeatures();
 }
 
 async function loadSession() {
@@ -569,8 +572,12 @@ function route() {
   if (view === "home") loadHome();
   if (view === "calendar") loadCalendar();
   if (view === "press" && !state.press.results.length) runPress(true);
+  if (view === "scoreboard") loadScoreboard();
+  if (view === "goals") loadGoals();
+  if (view === "meetings") loadMeetings();
+  if (view === "report") loadReport();
   document.querySelectorAll(".bottom-nav a").forEach((a) => a.setAttribute("aria-current",
-    a.dataset.view === view || (a.dataset.view === "more" && ["find", "mine", "agenda", "updates", "settings", "more"].includes(view)) ? "page" : "false"));
+    a.dataset.view === view || (a.dataset.view === "more" && ["find", "mine", "agenda", "updates", "settings", "more", "scoreboard", "goals", "meetings", "report"].includes(view)) ? "page" : "false"));
   window.scrollTo(0, 0);
 }
 
@@ -608,7 +615,8 @@ async function pollStatus() {
       await Promise.all([loadTracked(), loadUpdates(), loadSubjects(), loadAgenda(), loadSettings()]);
       if (currentView() === "find") runSearch(true);
       if (currentView() === "newbills") runNewBills(true);
-      let msg = { index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
+      if (currentView() === "report") loadReport();
+      let msg = { report: "This week’s report dates are up to date", index: "Search index is ready", refresh: "Tracked bills are up to date", filings: "Finished checking for new filings",
         texts: "Bill texts updated", calendar: "Calendar updated", press: "Press releases updated",
         summaries: job.result ? `Updated ${job.result.summarized} summar${job.result.summarized === 1 ? "y" : "ies"}` : "Summaries updated" }[job.kind];
       if (job.kind === "filings" && job.result) {
@@ -771,6 +779,11 @@ async function loadSettings() {
     "Each bill that moves gets one email listing its new actions.";
   $("#s-hearing").checked = s.hearing_email;
   $("#s-press").value = s.press_email;
+  $("#s-redline").checked = s.redline_email;
+  $("#s-report").checked = s.report_enabled;
+  $("#report-hour").textContent = s.report_hour === 12 ? "noon" : s.report_hour > 12 ? `${s.report_hour - 12} p.m.` : `${s.report_hour} a.m.`;
+  if (document.activeElement !== $("#s-report-to")) $("#s-report-to").value = (s.report_recipients || []).join("\n");
+  renderIcal();
   renderInstallHelp(); renderPush(); loadSources();
   loadHealth();
   const watching = state.status ? state.status.alerts_watch : s.alert_sessions.some((x) => x.code === state.session);
@@ -825,6 +838,9 @@ async function saveSettings(e) {
       movement_enabled: $("#s-movement").checked,
       hearing_email: $("#s-hearing").checked,
       press_email: $("#s-press").value,
+      redline_email: $("#s-redline").checked,
+      report_enabled: $("#s-report").checked,
+      report_recipients: $("#s-report-to").value.split(/[\s,;]+/).map((x) => x.trim()).filter(Boolean),
       movement_categories: [...document.querySelectorAll("#s-cats [data-cat]")].filter((x) => x.checked).map((x) => x.dataset.cat),
     } });
     toast("Settings saved");
@@ -1185,6 +1201,8 @@ function renderDrawer(d) {
       <div class="prog-steps">${d.progress.steps.map((st) => `<span class="${st.done ? "on" : st.current ? "cur" : ""}">${st.done ? "✓ " : ""}${esc(st.label)}</span>`).join(" › ")}</div>
     </div>` : ""}
 
+    ${versionsBlock(d)}
+
     <div class="d-links">
       <a class="btn btn-ghost btn-sm" href="${esc(d.url)}" target="_blank" rel="noopener">Open on oklegislature.gov</a>
       ${d.introduced_url ? `<a class="btn btn-ghost btn-sm" href="${esc(d.introduced_url)}" target="_blank" rel="noopener">Introduced text (PDF)</a>` : ""}
@@ -1198,6 +1216,8 @@ function renderDrawer(d) {
         <label for="t-position">Position<select id="t-position">${optionList(state.config.positions, t.position)}</select></label>
         <label for="t-priority">Priority<select id="t-priority">${optionList(state.config.priorities, t.priority)}</select></label>
         <label for="t-labels">Labels (comma separated)<input id="t-labels" value="${esc(t.labels)}" placeholder="e.g. education, budget"></label>
+        <label for="t-track">Track on the Friday report<input id="t-track" list="track-options" value="${esc(t.track || "")}" placeholder="Automatic (OneVoice task force)">
+          <datalist id="track-options">${(d.track_options || []).map((o) => `<option value="${esc(o)}">`).join("")}</datalist></label>
       </div>
       <label for="t-reason">Why this position<input id="t-reason" maxlength="1000" value="${esc(t.reason || "")}" placeholder="The reason for the Chamber’s position, for the record"></label>
       <label for="t-notes">Notes<textarea id="t-notes" placeholder="Talking points, contacts, next steps">${esc(t.notes)}</textarea></label>
@@ -1229,14 +1249,15 @@ function renderDrawer(d) {
     </div>`;
 
   bindAi(d);
+  bindVersions(d);
   bindReviews($("#drawer-body"), (bill, pid, verdict) => { (d.agenda || []).forEach((a) => { if (a.id === pid) a.review = verdict; }); if (currentView() === "find") runSearch(true); });
   if (t) {
     $("#t-position").addEventListener("change", (e) => saveTracking(d.bill, { position: e.target.value }));
     $("#t-priority").addEventListener("change", (e) => saveTracking(d.bill, { priority: e.target.value }));
     $("#track-form").addEventListener("submit", async (e) => {
       e.preventDefault();
-      const row = await saveTracking(d.bill, { notes: $("#t-notes").value, labels: $("#t-labels").value, reason: $("#t-reason").value });
-      if (row) d.tracked = { ...d.tracked, notes: row.notes, labels: row.labels, reason: row.reason };
+      const row = await saveTracking(d.bill, { notes: $("#t-notes").value, labels: $("#t-labels").value, reason: $("#t-reason").value, track: $("#t-track").value });
+      if (row) d.tracked = { ...d.tracked, notes: row.notes, labels: row.labels, reason: row.reason, track: row.track };
     });
     $("#untrack").addEventListener("click", () => {
       $("#untrack-area").innerHTML = `<span class="confirm">Remove ${esc(d.display)} and its notes? <button class="btn btn-danger btn-sm" type="button" id="untrack-yes">Remove</button><button class="btn btn-ghost btn-sm" type="button" id="untrack-no">Cancel</button></span>`;
@@ -1255,6 +1276,392 @@ function renderDrawer(d) {
       if (await track(d.bill)) openBill(d.session, d.bill);
     });
   }
+}
+
+// ------------------------------------------------------------------ chart helpers
+// Charts are plain HTML bars: thin marks, value labels in text colors, a hover
+// tooltip on every mark, and a table view of the same numbers.
+const POS_ORDER = ["support", "neutral", "monitor", "oppose"];
+let tipEl;
+function tip(e, html) {
+  if (!tipEl) { tipEl = document.createElement("div"); tipEl.className = "chart-tip"; tipEl.setAttribute("role", "tooltip"); document.body.appendChild(tipEl); }
+  if (!html) { tipEl.hidden = true; return; }
+  tipEl.innerHTML = html; tipEl.hidden = false;
+  const r = tipEl.getBoundingClientRect();
+  let x = e.clientX + 14, y = e.clientY + 14;
+  if (x + r.width > window.innerWidth - 8) x = e.clientX - r.width - 14;
+  if (y + r.height > window.innerHeight - 8) y = e.clientY - r.height - 14;
+  tipEl.style.left = `${Math.max(8, x)}px`; tipEl.style.top = `${Math.max(8, y)}px`;
+}
+function bindTips(root) {
+  root.querySelectorAll("[data-tip]").forEach((el) => {
+    el.addEventListener("pointermove", (e) => tip(e, el.dataset.tip));
+    el.addEventListener("pointerleave", () => tip(null, ""));
+    el.addEventListener("focus", () => { const r = el.getBoundingClientRect(); tip({ clientX: r.right, clientY: r.top }, el.dataset.tip); });
+    el.addEventListener("blur", () => tip(null, ""));
+  });
+}
+function barChart(rows, { total, unit = "bills", href } = {}) {
+  const max = Math.max(1, ...rows.map((r) => r.value));
+  return `<div class="hbars">${rows.map((r) => {
+    const pct = total ? ` (${Math.round((100 * r.value) / Math.max(1, total))}%)` : "";
+    const t = esc(`<b>${esc(r.label)}</b><br>${r.value.toLocaleString()} ${unit}${pct}`);
+    const inner = `<span class="hb-label">${esc(r.label)}</span>
+      <span class="hb-track"><span class="hb-bar" style="width:${(100 * r.value) / max}%"></span><span class="hb-val">${r.value.toLocaleString()}${pct}</span></span>`;
+    return r.href ? `<a class="hb-row" href="${esc(r.href)}" data-tip="${t}">${inner}</a>` : `<div class="hb-row" tabindex="0" data-tip="${t}">${inner}</div>`;
+  }).join("")}</div>`;
+}
+function dataTable(head, rows) {
+  return `<table class="data"><thead><tr>${head.map((h, i) => `<th${i ? ' class="num"' : ""}>${esc(h)}</th>`).join("")}</tr></thead>
+    <tbody>${rows.map((r) => `<tr>${r.map((c, i) => `<td${i ? ' class="num"' : ""}>${esc(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+}
+
+// ------------------------------------------------------------------ scoreboard
+let sbTables = false;
+async function loadScoreboard() {
+  let d;
+  try { d = await api(`/api/scoreboard?session=${state.session}`); } catch (e) { $("#sb-kpis").innerHTML = `<p class="hint">${esc(e.message)}</p>`; return; }
+  const k = d.kpis;
+  $("#sb-title").textContent = `${d.session_name} scoreboard`;
+  $("#sb-sub").textContent = d.closed ? "Final results for the session." : "Updates as bills move. Positions come from your tracking list.";
+  const kpi = (v, label, sub, href) => `<a class="kpi" href="${href}"><b>${v}</b><span>${esc(label)}</span>${sub ? `<small>${esc(sub)}</small>` : ""}</a>`;
+  $("#sb-kpis").innerHTML = [
+    kpi(k.onevoice.toLocaleString(), "OneVoice bills filed", "match the agenda", "#newbills"),
+    kpi(k.relevant.toLocaleString(), "Marked Relevant", "by your team", "#newbills"),
+    kpi(k.tracked.toLocaleString(), "Tracked", `${k.with_position} with a position other than Monitor`, "#mine"),
+    kpi(k.enacted.toLocaleString(), "OneVoice bills enacted", "signed into law", "#scoreboard"),
+    kpi(k.win_rate == null ? "–" : `${k.win_rate}%`, "Supported bills enacted", k.supported ? `${k.supported_enacted} of ${k.supported} supported` : "No Support positions yet", "#mine"),
+    kpi(d.wins.length.toLocaleString(), "Wins", "supported and passed, or opposed and stopped", "#scoreboard"),
+  ].join("");
+  const tf = d.by_task_force.map((r) => ({ label: r.task_force, value: r.count, href: "#newbills" }));
+  const funnel = d.funnel.map((r) => ({ label: r.label, value: r.count }));
+  const posTotal = d.positions.reduce((a, p) => a + p.count, 0);
+  const posLegend = `<div class="legend">${POS_ORDER.map((p) => { const n = (d.positions.find((x) => x.position === p) || {}).count || 0;
+    return `<span><i class="sw sw-${p}"></i>${cap(p)} <b>${n}</b></span>`; }).join("")}</div>`;
+  const posBar = posTotal ? `<div class="stack-bar">${POS_ORDER.map((p) => { const n = (d.positions.find((x) => x.position === p) || {}).count || 0;
+    return n ? `<span class="seg-${p}" style="flex:${n}" tabindex="0" data-tip="${esc(`<b>${cap(p)}</b><br>${n} bill${n === 1 ? "" : "s"} (${Math.round((100 * n) / posTotal)}%)`)}"></span>` : ""; }).join("")}</div>` : `<p class="hint">Choose a position on tracked bills and it shows up here.</p>`;
+  const card = (title, sub, chart, table) => `<figure class="chart-card"><figcaption><b>${esc(title)}</b><span class="hint">${esc(sub)}</span></figcaption>${sbTables ? table : chart}</figure>`;
+  $("#sb-charts").innerHTML = [
+    card("OneVoice bills by task force", "Bills matching each task force’s priorities (a bill can match more than one)", barChart(tf),
+      dataTable(["Task force", "Bills"], tf.map((r) => [r.label, r.value]))),
+    card("How far OneVoice bills got", "Bills that reached each step (share of all OneVoice bills)", barChart(funnel, { total: k.onevoice }),
+      dataTable(["Step reached", "Bills", "Share"], funnel.map((r) => [r.label, r.value, `${Math.round((100 * r.value) / Math.max(1, k.onevoice))}%`]))),
+    card("Chamber positions", `${posTotal} tracked bill${posTotal === 1 ? "" : "s"}`, posLegend + posBar,
+      dataTable(["Position", "Bills"], POS_ORDER.map((p) => [cap(p), (d.positions.find((x) => x.position === p) || {}).count || 0]))),
+  ].join("");
+  const li = (w) => `<li><button class="linklike" type="button" data-open-bill="${esc(w.bill)}"><b>${esc(w.display)}</b></button> ${esc(w.title)} <span class="hint">· ${esc(w.why)}</span></li>`;
+  $("#sb-wins").innerHTML = `<h2>Wins</h2>${d.wins.length ? `<ol class="win-list">${d.wins.map(li).join("")}</ol>` : `<p class="hint">Bills you supported that become law, and bills you opposed that are stopped, are listed here.</p>`}
+    ${d.losses.length ? `<h3 class="sub-h">Didn’t go our way</h3><ol class="win-list">${d.losses.map(li).join("")}</ol>` : ""}`;
+  bindTips($("#sb-charts"));
+  document.querySelectorAll("#sb-wins [data-open-bill]").forEach((b) => b.addEventListener("click", () => openBill(state.session, b.dataset.openBill)));
+}
+
+// ------------------------------------------------------------------ goals
+const G = { year: null, data: null, tab: "score" };
+const STATUS_TXT = { met: "✓ Goal met", on_track: "● On pace", behind: "▲ Behind pace", upcoming: "Starts Jan. 1", open: "In progress", info: "" };
+function yearOptions(sel, chosen) {
+  const now = new Date().getFullYear();
+  const years = [...new Set([now - 1, now, now + 1, 2027, chosen])].filter(Boolean).sort();
+  $(sel).innerHTML = years.map((y) => `<option ${y === chosen ? "selected" : ""}>${y}</option>`).join("");
+}
+function meter(m) {
+  if (!m.target) return "";
+  const pct = Math.min(100, (100 * (m.value || 0)) / m.target);
+  const exp = m.expected != null && m.status !== "met" ? Math.min(100, (100 * m.expected) / m.target) : null;
+  return `<div class="meter" role="img" aria-label="${esc(`${m.value ?? 0} of ${m.target}`)}"><span class="meter-fill st-${m.status}" style="width:${pct}%"></span>
+    ${exp != null && exp > 0 ? `<span class="meter-pace" style="left:${exp}%" title="Where we should be by today: ${m.expected}"></span>` : ""}</div>`;
+}
+function metricTip(m) {
+  return esc(`<b>${esc(m.label)}</b><br>${m.value ?? "–"}${m.unit} of ${m.target ?? "–"}${m.unit}` +
+    (m.expected != null && m.status !== "met" && m.status !== "upcoming" ? `<br>Pace for today: ${m.expected}${m.unit}` : "") + (m.note ? `<br>${esc(m.note)}` : ""));
+}
+async function loadGoals() {
+  try { G.data = await api(`/api/goals${G.year ? `?year=${G.year}` : ""}`); G.year = G.data.year; } catch (e) { $("#goals-score").innerHTML = `<p class="hint">${esc(e.message)}</p>`; return; }
+  yearOptions("#goals-year", G.year);
+  $("#goals-export").href = `/api/goals/export.xlsx?year=${G.year}`;
+  $("#goals-title").textContent = `${G.year} Government Affairs goals`;
+  $("#goals-sub").textContent = `Owner: ${G.data.owner}. Bill numbers fill in on their own; log meetings, donors and activities as they happen.`;
+  renderGoalTabs();
+}
+function renderGoalTabs() {
+  document.querySelectorAll("#goals-tabs [data-gtab]").forEach((b) => b.setAttribute("aria-selected", String(b.dataset.gtab === G.tab)));
+  ["score", "log", "milestones"].forEach((t) => ($(`#goals-${t}`).hidden = t !== G.tab));
+  if (G.tab === "score") renderGoalScore();
+  if (G.tab === "log") renderGoalLog();
+  if (G.tab === "milestones") renderMilestones();
+}
+function renderGoalScore() {
+  const d = G.data;
+  const head = d.metrics.filter((m) => m.headline);
+  const big = head.map((m) => `<div class="goal-kpi" tabindex="0" data-tip="${metricTip(m)}">
+      <span class="gk-label">${esc(m.label)}</span>
+      <b>${m.value ?? "–"}${esc(m.unit)}<small> / ${m.target}${esc(m.unit)}</small></b>
+      ${meter(m)}<span class="st-chip st-${m.status}">${STATUS_TXT[m.status]}</span></div>`).join("");
+  const goalSec = d.goals.map((g) => `<section class="panel wide goal-sec"><h2>Goal ${g.n}: ${esc(g.title)}</h2><p class="hint">${esc(g.text)}</p>
+      <ul class="metric-list">${d.metrics.filter((m) => m.goal === g.n).map((m) => `<li tabindex="0" data-tip="${metricTip(m)}">
+        <span class="ml-label">${esc(m.label)}${m.note ? `<small>${esc(m.note)}</small>` : ""}</span>
+        <span class="ml-val">${m.value ?? "–"}${esc(m.unit)}${m.target ? ` <small>of ${m.target}${esc(m.unit)}</small>` : ""}</span>
+        ${meter(m) || "<span></span>"}<span class="st-chip st-${m.status}">${STATUS_TXT[m.status]}</span></li>`).join("")}</ul>
+      ${g.n === 1 ? goalBills() : ""}${g.n === 2 ? `<a class="btn btn-ghost btn-sm" href="#meetings">Log a meeting</a>` : ""}
+      ${g.n === 3 ? `<button class="btn btn-ghost btn-sm" type="button" data-gtab-go="log">Log a donor or PAC activity</button>` : ""}</section>`).join("");
+  const t = d.targets;
+  const editable = [["bills_passed", "OneVoice bills passed"], ["ballot_designated", "Designated ballot initiatives"], ["contacts", "Face-to-face contacts"],
+    ["contacts_local", "Municipal/county contacts"], ["contacts_state", "State contacts"], ["contacts_federal", "Federal contacts"], ["distinct", "Distinct leaders"],
+    ["roundtable", "Briefings/roundtables"], ["coalition", "Coalition updates"], ["federal", "Federal initiatives"], ["quarterly_report", "Quarterly reports"],
+    ["donors", "PAC donors"], ["pac_board", "Board meetings per PAC"], ["attendance", "Board attendance %"], ["forum", "PAC forums"]];
+  $("#goals-score").innerHTML = `<div class="goal-kpis">${big}</div>
+    <p class="hint legend-line"><span class="pace-key"></span> marks where each number should be by today, based on the quarterly targets (or an even pace through the year).</p>
+    ${goalSec}
+    <details class="panel wide"><summary><b>Edit targets</b></summary>
+      <form id="targets-form" class="targets">${editable.map(([k, l]) => `<label>${esc(l)}<input type="number" min="0" name="${k}" value="${t[k]}"></label>`).join("")}
+      <div class="row-end"><button class="btn btn-sm" type="submit">Save targets</button></div></form></details>`;
+  bindTips($("#goals-score"));
+  document.querySelectorAll("[data-gtab-go]").forEach((b) => b.addEventListener("click", () => { G.tab = b.dataset.gtabGo; renderGoalTabs(); }));
+  document.querySelectorAll("[data-gbill]").forEach((b) => b.addEventListener("click", async () => {
+    try { G.data = await api("/api/goals/bill", { method: "POST", body: { year: G.year, bill: b.dataset.gbill, count: b.dataset.count === "null" ? null : b.dataset.count === "true" } }); renderGoalScore(); }
+    catch (e) { toast(e.message, true); }
+  }));
+  const addForm = $("#gbill-add");
+  if (addForm) addForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try { G.data = await api("/api/goals/bill", { method: "POST", body: { year: G.year, bill: $("#gbill-input").value, count: true } }); renderGoalScore(); toast("Bill counted"); }
+    catch (err) { toast(err.message, true); }
+  });
+  $("#targets-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = Object.fromEntries([...new FormData(e.target)].map(([k, v]) => [k, Number(v)]));
+    try { G.data = await api(`/api/goals/targets?year=${G.year}`, { method: "PUT", body }); toast("Targets saved"); renderGoalScore(); }
+    catch (err) { toast(err.message, true); }
+  });
+}
+function goalBills() {
+  const b = G.data.bills;
+  return `<details class="gbills"><summary>Bills counted toward “bills passed” (${b.length})</summary>
+    <p class="hint">Counted automatically: enacted bills that match the agenda and that you supported or marked Relevant. Add or remove any bill by hand.</p>
+    <ul>${b.map((x) => `<li><b>${esc(x.display)}</b> ${esc(x.title)} ${x.added ? '<span class="hint">(added by hand)</span>' : ""}
+      <button class="btn btn-ghost btn-sm" type="button" data-gbill="${esc(x.bill)}" data-count="${x.added ? "null" : "false"}">Don’t count</button></li>`).join("") || '<li class="hint">None yet.</li>'}</ul>
+    <form class="toolbar" id="gbill-add"><input id="gbill-input" placeholder="Bill number, e.g. HB 1234" aria-label="Bill to count"><button class="btn btn-sm" type="submit">Count this bill</button></form></details>`;
+}
+function todayIso() { return isoDate(new Date()); }
+function entryForm(kind) {
+  const d = G.data;
+  if (kind === "donor") return `<form class="panel" id="donor-form"><h2>Log a PAC donor</h2>
+    <div class="form-grid"><label>Date<input type="date" name="date" value="${todayIso()}" required></label>
+    <label>Donor<input name="name" required placeholder="Name or company"></label>
+    <label>PAC<select name="pac">${d.pacs.map((p) => `<option>${esc(p)}</option>`).join("")}</select></label>
+    <label>New or reactivated<select name="status"><option value="new">New</option><option value="reactivated">Reactivated</option></select></label>
+    <label>Amount (optional)<input name="amount" inputmode="decimal" placeholder="$"></label></div>
+    <label class="stack">Notes<input name="notes"></label><div class="row-end"><button class="btn" type="submit">Save donor</button></div></form>`;
+  return `<form class="panel" id="activity-form"><h2>Log an activity</h2>
+    <div class="form-grid"><label>Date<input type="date" name="date" value="${todayIso()}" required></label>
+    <label>What kind<select name="type" id="act-type">${Object.entries(d.activity_types).map(([k, v]) => `<option value="${k}">${esc(v)}</option>`).join("")}</select></label>
+    <label>Title<input name="title" placeholder="e.g. Q1 policy report, DC Fly-In"></label>
+    <label id="act-pac-l">PAC<select name="pac"><option value="">–</option>${d.pacs.map((p) => `<option>${esc(p)}</option>`).join("")}</select></label>
+    <label id="act-att-l">Board attendance %<input name="attendance" type="number" min="0" max="100"></label></div>
+    <label class="stack">Notes<input name="notes"></label><div class="row-end"><button class="btn" type="submit">Save activity</button></div></form>`;
+}
+async function renderGoalLog() {
+  $("#goals-log").innerHTML = `<div class="two-col">${entryForm("donor")}${entryForm("activity")}</div><div id="glog-list"><p class="hint">Loading…</p></div>`;
+  const syncAct = () => { const t = $("#act-type").value; $("#act-pac-l").hidden = !["pac_board", "forum", "pac_review"].includes(t); $("#act-att-l").hidden = t !== "pac_board"; };
+  $("#act-type").addEventListener("change", syncAct); syncAct();
+  for (const [id, kind] of [["#donor-form", "donor"], ["#activity-form", "activity"]]) {
+    $(id).addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const body = { kind, ...Object.fromEntries(new FormData(e.target)) };
+      try { await api("/api/goals/log", { method: "POST", body }); toast("Saved"); G.data = await api(`/api/goals?year=${G.year}`); renderGoalLog(); }
+      catch (err) { toast(err.message, true); }
+    });
+  }
+  let rows = [];
+  try { rows = (await api(`/api/goals/log?year=${G.year}`)).filter((r) => r.kind !== "meeting"); } catch { /* shown empty */ }
+  const types = G.data.activity_types;
+  $("#glog-list").innerHTML = rows.length ? `<table class="data log-table"><thead><tr><th>Date</th><th>Entry</th><th>Details</th><th></th></tr></thead><tbody>${rows.map((r) => `
+    <tr><td>${fmtDate(r.date)}</td><td>${r.kind === "donor" ? `<b>${esc(r.name)}</b> · ${esc(r.pac)} donor (${esc(r.status)})` : `<b>${esc(types[r.type] || r.type)}</b>${r.title ? ` · ${esc(r.title)}` : ""}`}</td>
+    <td>${esc([r.amount, r.pac && r.kind === "activity" ? r.pac : "", r.attendance ? `${r.attendance}% attendance` : "", r.notes].filter(Boolean).join(" · "))}</td>
+    <td><button class="btn btn-ghost btn-sm" type="button" data-del-entry="${r.id}">Delete</button></td></tr>`).join("")}</tbody></table>`
+    : `<p class="hint">Nothing logged for ${G.year} yet.</p>`;
+  document.querySelectorAll("[data-del-entry]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("Delete this entry?")) return;
+    await api(`/api/goals/log/${b.dataset.delEntry}`, { method: "DELETE" }); G.data = await api(`/api/goals?year=${G.year}`); renderGoalLog();
+  }));
+}
+function renderMilestones() {
+  const ms = G.data.milestones;
+  $("#goals-milestones").innerHTML = G.data.goals.map((g) => `<section class="panel wide"><h2>Goal ${g.n}: ${esc(g.title)}</h2>
+    ${[1, 2, 3, 4].map((q) => { const items = ms.filter((m) => m.goal === g.n && m.quarter === q); return items.length ? `<h3 class="sub-h">Q${q}</h3>
+      ${items.map((m) => `<label class="check ms${m.late ? " late" : ""}" for="ms-${m.id}"><input type="checkbox" id="ms-${m.id}" data-ms="${m.id}" ${m.done ? "checked" : ""}>
+        ${esc(m.label)} <span class="hint">${m.done ? `done ${fmtDate(m.done.at.slice(0, 10))}` : `due ${fmtDate(m.due)}${m.late ? " · overdue" : ""}`}</span></label>`).join("")}` : ""; }).join("")}</section>`).join("");
+  document.querySelectorAll("[data-ms]").forEach((c) => c.addEventListener("change", async () => {
+    try { G.data = await api("/api/goals/milestone", { method: "POST", body: { year: G.year, id: c.dataset.ms, done: c.checked } }); renderMilestones(); }
+    catch (e) { toast(e.message, true); }
+  }));
+}
+
+// ------------------------------------------------------------------ meetings log
+const MT = { year: new Date().getFullYear(), editing: null, rows: [] };
+const LEVELS = { local: "Municipal / county", state: "State", federal: "Federal", other: "Other policy leader" };
+function meetingForm(e = {}) {
+  return `<h2>${e.id ? "Edit meeting" : "Log a meeting"}</h2>
+    <label class="stack">Who met (one name per line)<textarea name="people" rows="3" required placeholder="Rep. Jane Doe&#10;Sen. John Smith">${esc(e.people || "")}</textarea></label>
+    <div class="form-grid">
+      <label>Date<input type="date" name="date" value="${esc(e.date || todayIso())}" required></label>
+      <label>Level<select name="level">${Object.entries(LEVELS).map(([k, v]) => `<option value="${k}" ${k === (e.level || "state") ? "selected" : ""}>${esc(v)}</option>`).join("")}</select></label>
+      <label>Organization or office<input name="entity" value="${esc(e.entity || "")}" placeholder="e.g. Oklahoma House, City of Tulsa"></label>
+      <label>Chamber staff there<input name="staff" value="${esc(e.staff || "")}" placeholder="Who from the Chamber"></label>
+    </div>
+    <label class="stack">Overview of the discussion<textarea name="overview" rows="5" placeholder="What was discussed, what they said, where they stand">${esc(e.overview || "")}</textarea></label>
+    <div class="form-grid">
+      <label>Issues<input name="issues" value="${esc(e.issues || "")}" placeholder="e.g. housing, workforce"></label>
+      <label>Bills discussed<input name="bills" value="${esc((e.bills_display || []).join(", "))}" placeholder="HB 1234, SB 56"></label>
+    </div>
+    <label class="stack">Follow-up<input name="follow_up" value="${esc(e.follow_up || "")}" placeholder="Next steps and who owns them"></label>
+    <label class="check"><input type="checkbox" name="in_person" ${e.in_person === false ? "" : "checked"}> In person (counts toward the face-to-face contact goal)</label>
+    <div class="row-end"><button class="btn" type="submit">${e.id ? "Save changes" : "Save meeting"}</button><button class="btn btn-ghost" type="button" id="mt-cancel">Cancel</button></div>`;
+}
+function openMeetingForm(e) {
+  MT.editing = e ? e.id : null;
+  const f = $("#mt-form");
+  f.innerHTML = meetingForm(e || {});
+  f.hidden = false;
+  $("#mt-cancel").addEventListener("click", () => { f.hidden = true; MT.editing = null; });
+  f.scrollIntoView({ behavior: "smooth", block: "start" });
+  f.querySelector("textarea[name=people]").focus({ preventScroll: true });
+}
+async function saveMeeting(ev) {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const body = { kind: "meeting", ...Object.fromEntries(fd), in_person: fd.get("in_person") === "on" };
+  try {
+    await api(MT.editing ? `/api/goals/log/${MT.editing}` : "/api/goals/log", { method: MT.editing ? "PUT" : "POST", body });
+    toast(MT.editing ? "Meeting updated" : "Meeting saved");
+    $("#mt-form").hidden = true; MT.editing = null;
+    if (body.date.slice(0, 4) !== String(MT.year)) MT.year = Number(body.date.slice(0, 4));
+    loadMeetings();
+  } catch (err) { toast(err.message, true); }
+}
+async function loadMeetings() {
+  yearOptions("#mt-year", MT.year);
+  const q = $("#mt-q").value.trim();
+  try { MT.rows = await api(`/api/goals/log?kind=meeting&year=${MT.year}${q ? `&q=${encodeURIComponent(q)}` : ""}`); } catch (e) { $("#mt-list").innerHTML = `<li class="hint">${esc(e.message)}</li>`; return; }
+  const people = MT.rows.filter((r) => r.in_person !== false).reduce((n, r) => n + Math.max(1, (r.people || "").split(/[\n;]+/).filter((x) => x.trim()).length), 0);
+  $("#mt-meta").textContent = `${MT.rows.length} meeting${MT.rows.length === 1 ? "" : "s"} in ${MT.year}${q ? " matching your search" : ""} · ${people} face-to-face contact${people === 1 ? "" : "s"}`;
+  $("#mt-list").innerHTML = MT.rows.map((r) => `<li class="log-card">
+      <div class="log-top"><span class="date">${fmtDate(r.date)}</span><span class="chip">${esc(LEVELS[r.level] || "")}</span>${r.in_person === false ? '<span class="chip">Not in person</span>' : ""}</div>
+      <h3>${esc((r.people || "").split(/[\n;]+/).filter((x) => x.trim()).join(", ") || r.entity)}</h3>
+      ${r.entity ? `<p class="hint">${esc(r.entity)}${r.staff ? ` · with ${esc(r.staff)}` : ""}</p>` : r.staff ? `<p class="hint">With ${esc(r.staff)}</p>` : ""}
+      ${r.overview ? `<p class="log-overview">${esc(r.overview)}</p>` : ""}
+      ${r.issues ? `<p><b>Issues:</b> ${esc(r.issues)}</p>` : ""}
+      ${r.bills_display && r.bills_display.length ? `<p><b>Bills:</b> ${r.bills.map((b, i) => `<button class="linklike" type="button" data-open-bill="${esc(b)}">${esc(r.bills_display[i])}</button>`).join(", ")}</p>` : ""}
+      ${r.follow_up ? `<p><b>Follow-up:</b> ${esc(r.follow_up)}</p>` : ""}
+      <div class="row-end"><button class="btn btn-ghost btn-sm" type="button" data-edit-mt="${r.id}">Edit</button><button class="btn btn-ghost btn-sm" type="button" data-del-mt="${r.id}">Delete</button></div>
+    </li>`).join("") || `<li class="empty"><h2>No meetings logged${q ? " match your search" : ` for ${MT.year}`}</h2><p>Tap “Log a meeting” after you meet with a legislator, mayor, commissioner or other policy leader.</p></li>`;
+  document.querySelectorAll("#mt-list [data-open-bill]").forEach((b) => b.addEventListener("click", () => openBill(state.session, b.dataset.openBill)));
+  document.querySelectorAll("[data-edit-mt]").forEach((b) => b.addEventListener("click", () => openMeetingForm(MT.rows.find((r) => r.id === Number(b.dataset.editMt)))));
+  document.querySelectorAll("[data-del-mt]").forEach((b) => b.addEventListener("click", async () => {
+    if (!confirm("Delete this meeting?")) return;
+    await api(`/api/goals/log/${b.dataset.delMt}`, { method: "DELETE" }); toast("Meeting deleted"); loadMeetings();
+  }));
+}
+
+// ------------------------------------------------------------------ Friday report
+const RP = { week: null };
+async function loadReport() {
+  if (!RP.week) RP.week = mondayOf(new Date());
+  const wk = isoDate(RP.week);
+  const scope = $("#rp-scope").value;
+  $("#rp-week").textContent = isoDate(mondayOf(new Date())) === wk ? "This week" : `Week of ${RP.week.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`;
+  $("#rp-download").href = `/api/report.xlsx?session=${state.session}&week=${wk}&scope=${scope}`;
+  $("#rp-table").innerHTML = `<p class="hint">Loading…</p>`;
+  let d;
+  try { d = await api(`/api/report?session=${state.session}&week=${wk}&scope=${scope}`); } catch (e) { $("#rp-table").innerHTML = `<p class="hint">${esc(e.message)}</p>`; return; }
+  $("#rp-download").setAttribute("download", d.filename);
+  $("#rp-count").textContent = `${d.rows.length} bill${d.rows.length === 1 ? "" : "s"} with action · ${d.filename}`;
+  $("#rp-table").innerHTML = d.rows.length ? `<table class="data report"><thead><tr><th>Track</th><th>Bill</th><th>AI Summary</th><th>Last action date</th></tr></thead><tbody>
+    ${d.rows.map((r) => `<tr><td>${esc(r.track)}</td><td><button class="linklike" type="button" data-open-bill="${esc(r.bill)}"><b>${esc(r.display)}</b></button></td>
+      <td>${esc(r.summary)}<div class="hint">${esc(r.last_action)}</div></td><td>${fmtDate(r.date)}</td></tr>`).join("")}</tbody></table>`
+    : `<div class="empty"><h2>No OneVoice or tracked bills had action this week</h2><p>During session this fills in as bills move. Use the arrows to look at another week.</p></div>`;
+  document.querySelectorAll("#rp-table [data-open-bill]").forEach((b) => b.addEventListener("click", () => openBill(state.session, b.dataset.openBill)));
+}
+
+// ------------------------------------------------------------------ Outlook link
+async function renderIcal(fresh) {
+  const s = fresh || (state.settings && state.settings.ical);
+  if (!s) return;
+  const url = $("#ical-all").checked ? s.all : s.hearings;
+  $("#ical-url").value = url;
+  $("#ical-open").href = url.replace(/^https?:\/\//, "webcal://");
+}
+
+// ------------------------------------------------------------------ bill versions in the drawer
+function versionsBlock(d) {
+  const v = d.versions || [];
+  const reds = d.redlines || [];
+  if (v.length < 2 && !reds.length) return "";
+  return `<div class="d-versions"><h3 class="section-h">What changed?</h3>
+    ${reds.map((r) => `<div class="redline-item"><button class="linklike" type="button" data-redline="${r.id}"><b>${esc(r.old)} → ${esc(r.new)}</b></button>
+      <span class="hint">${fmtDate(r.at.slice(0, 10))} · ${esc(r.headline)}</span></div>`).join("")}
+    ${v.length >= 2 ? `<form class="compare" id="cmp-form"><label>From<select id="cmp-a">${v.map((x, i) => `<option value="${esc(x.url)}" ${i === 0 ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>
+      <label>To<select id="cmp-b">${v.map((x, i) => `<option value="${esc(x.url)}" ${i === v.length - 1 ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>
+      <button class="btn btn-sm" type="submit">Compare</button></form>` : ""}
+    <div id="cmp-out"></div></div>`;
+}
+function showRedline(r) {
+  $("#cmp-out").innerHTML = `<p><b>${esc(r.old)} → ${esc(r.new)}</b>: ${esc(r.headline)}</p>
+    ${r.gained && r.gained.length ? `<p class="kw-gain">Now mentions: ${esc(r.gained.join(", "))}</p>` : ""}
+    ${r.lost && r.lost.length ? `<p class="kw-lost">No longer mentions: ${esc(r.lost.join(", "))}</p>` : ""}
+    <p class="hint redline-key"><del>struck red</del> = taken out · <ins>green</ins> = added</p><div class="redline">${r.html}</div>`;
+}
+function bindVersions(d) {
+  document.querySelectorAll("[data-redline]").forEach((b) => b.addEventListener("click", async () => {
+    try { showRedline(await api(`/api/redline/${b.dataset.redline}`)); } catch (e) { toast(e.message, true); }
+  }));
+  const f = $("#cmp-form");
+  if (!f) return;
+  f.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if ($("#cmp-a").value === $("#cmp-b").value) { toast("Pick two different versions.", true); return; }
+    $("#cmp-out").innerHTML = `<p class="hint">Reading both versions…</p>`;
+    try { showRedline(await api(`/api/bill/${d.session}/${d.bill}/compare?a=${encodeURIComponent($("#cmp-a").value)}&b=${encodeURIComponent($("#cmp-b").value)}`)); }
+    catch (err) { $("#cmp-out").innerHTML = `<p class="hint">${esc(err.message)}</p>`; }
+  });
+}
+
+function bindNewFeatures() {
+  $("#sb-table-toggle").addEventListener("click", (e) => { sbTables = !sbTables; e.target.setAttribute("aria-pressed", String(sbTables)); e.target.textContent = sbTables ? "Show as charts" : "Show as tables"; loadScoreboard(); });
+  $("#goals-year").addEventListener("change", (e) => { G.year = Number(e.target.value); loadGoals(); });
+  document.querySelectorAll("#goals-tabs [data-gtab]").forEach((b) => b.addEventListener("click", () => { G.tab = b.dataset.gtab; renderGoalTabs(); }));
+  $("#mt-add").addEventListener("click", () => openMeetingForm(null));
+  $("#mt-form").addEventListener("submit", saveMeeting);
+  let mtTimer;
+  $("#mt-q").addEventListener("input", () => { clearTimeout(mtTimer); mtTimer = setTimeout(loadMeetings, 250); });
+  $("#mt-year").addEventListener("change", (e) => { MT.year = Number(e.target.value); loadMeetings(); });
+  $("#rp-prev").addEventListener("click", () => { RP.week.setDate(RP.week.getDate() - 7); loadReport(); });
+  $("#rp-next").addEventListener("click", () => { RP.week.setDate(RP.week.getDate() + 7); loadReport(); });
+  $("#rp-scope").addEventListener("change", loadReport);
+  $("#rp-email").addEventListener("click", async (e) => {
+    e.target.disabled = true;
+    try { const r = await api("/api/report/send", { method: "POST", body: { week: isoDate(RP.week) } }); toast(`Sent to ${r.to.join(", ")}`); }
+    catch (err) { toast(err.message, true); } finally { e.target.disabled = false; }
+  });
+  $("#rp-prepare").addEventListener("click", async () => {
+    try { await api("/api/report/prepare", { method: "POST", body: { session: state.session, week: isoDate(RP.week) } });
+      toast("Re-reading this week’s bills from oklegislature.gov. The list refreshes when it’s done."); pollStatus(); }
+    catch (err) { toast(err.message, true); }
+  });
+  $("#ical-all").addEventListener("change", () => renderIcal());
+  $("#ical-copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText($("#ical-url").value); toast("Calendar link copied"); }
+    catch { $("#ical-url").select(); toast("Press Ctrl+C (or long-press) to copy"); }
+  });
+  $("#ical-reset").addEventListener("click", () => {
+    $("#ical-reset-area").innerHTML = `<span class="confirm">The old link will stop working. <button class="btn btn-danger btn-sm" type="button" id="ical-reset-yes">Make a new link</button></span>`;
+    $("#ical-reset-yes").addEventListener("click", async () => {
+      const r = await api("/api/ical/reset", { method: "POST" });
+      state.settings.ical = r; renderIcal(r); toast("New calendar link made");
+      $("#ical-reset-area").innerHTML = `<button class="btn btn-ghost btn-sm" type="button" id="ical-reset">Make a new link</button>`;
+    });
+  });
+  $("#cal-outlook").addEventListener("click", (e) => { e.preventDefault(); location.hash = "#settings"; setTimeout(() => $("#settings-outlook").scrollIntoView({ behavior: "smooth" }), 50); });
 }
 
 boot().catch((e) => {

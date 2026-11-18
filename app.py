@@ -34,6 +34,7 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 
 import oklegis as ok
 import onevoice as ov
+import redline as rl
 import sources as so
 import summarize as sm
 
@@ -150,6 +151,13 @@ CREATE TABLE IF NOT EXISTS hearing_alerts (
 CREATE TABLE IF NOT EXISTS push_subs (
   endpoint TEXT PRIMARY KEY, sub TEXT NOT NULL, label TEXT, prefs TEXT, created TEXT, last_ok TEXT, fails INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS redlines (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL, bill TEXT NOT NULL,
+  old_version TEXT, old_url TEXT, new_version TEXT, new_url TEXT, old_body BLOB,
+  headline TEXT, diff TEXT, keywords TEXT DEFAULT '{}', at TEXT NOT NULL, emailed INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS goal_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, date TEXT NOT NULL, data TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL, updated_at TEXT);
 """
 
 
@@ -169,11 +177,14 @@ def init_db() -> None:
     with db() as c:
         c.executescript(SCHEMA)
         cols = {r["name"] for r in c.execute("PRAGMA table_info(bills)")}
-        for col in ("first_seen", "matched_at", "author"):
+        for col in ("first_seen", "matched_at", "author", "index_action", "moved_at"):
             if col not in cols:  # upgrade a database made by an earlier version
                 c.execute(f"ALTER TABLE bills ADD COLUMN {col} TEXT")
-        if "reason" not in {r["name"] for r in c.execute("PRAGMA table_info(tracked)")}:
+        tcols = {r["name"] for r in c.execute("PRAGMA table_info(tracked)")}
+        if "reason" not in tcols:
             c.execute("ALTER TABLE tracked ADD COLUMN reason TEXT DEFAULT ''")
+        if "track" not in tcols:
+            c.execute("ALTER TABLE tracked ADD COLUMN track TEXT DEFAULT ''")
         try:
             c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS bill_fts USING fts5(session UNINDEXED, bill UNINDEXED, title, summary, body)")
         except sqlite3.OperationalError:
@@ -266,6 +277,10 @@ def settings() -> dict:
         "movement_categories": s.get("movement_categories", ok.DEFAULT_MOVEMENT_CATEGORIES),
         "hearing_email": s.get("hearing_email", True),
         "press_email": s.get("press_email", "tracked"),  # tracked | agenda | off
+        "redline_email": s.get("redline_email", True),
+        "report_enabled": s.get("report_enabled", True),
+        "report_scope": s.get("report_scope", "onevoice"),  # onevoice | watched
+        "report_recipients": s.get("report_recipients", []),
     }
 
 
@@ -351,7 +366,16 @@ def match_session(session: str, all_bills: bool = False, fetch_text: bool = Fals
 
 def store_text(session: str, bill: str, version: str, url: str, text: str, error: str | None = None) -> None:
     with db() as c:
-        prev = c.execute("SELECT source_url FROM texts WHERE session=? AND bill=?", (session, bill)).fetchone()
+        prev = c.execute("SELECT version, source_url, body, chars FROM texts WHERE session=? AND bill=?", (session, bill)).fetchone()
+    if prev and text and prev["chars"] and prev["source_url"] and prev["source_url"] != url:
+        try:
+            record_redline(session, bill, prev["version"] or "Earlier version", prev["source_url"],
+                           zlib.decompress(prev["body"]).decode("utf-8"), version, url, text)
+        except Exception as e:  # noqa: BLE001 - a failed comparison never blocks saving the new text
+            log_event("redline", False, str(e)[:200], bill=bill)
+    if error and prev and prev["chars"]:
+        return  # the new version didn't download: keep the old text (and compare later) rather than lose it
+    with db() as c:
         c.execute(
             "INSERT OR REPLACE INTO texts(session,bill,version,source_url,body,chars,fetched_at,error) VALUES(?,?,?,?,?,?,?,?)",
             (session, bill, version, url, zlib.compress(text.encode("utf-8")), len(text), now_iso(), error),
@@ -495,15 +519,18 @@ def upsert_index(session: str, entries: dict[str, ok.IndexEntry]) -> None:
             t, n = ok.split_bill(e.bill)
             stage = ok.stage_from_last_action(e.bill, e.last_action)
             c.execute(
-                """INSERT INTO bills(session,bill,bill_type,bill_num,title,last_action,stage,subjects,indexed_at,first_seen)
-                   VALUES(?,?,?,?,?,?,?,?,?,?)
+                """INSERT INTO bills(session,bill,bill_type,bill_num,title,last_action,stage,subjects,indexed_at,first_seen,index_action,moved_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(session,bill) DO UPDATE SET
                      title=excluded.title, indexed_at=excluded.indexed_at,
+                     moved_at=CASE WHEN bills.index_action IS NOT NULL AND bills.index_action!=excluded.index_action
+                                   THEN excluded.moved_at ELSE bills.moved_at END,
+                     index_action=excluded.index_action,
                      matched_at=CASE WHEN bills.subjects=excluded.subjects THEN bills.matched_at ELSE NULL END,
                      subjects=excluded.subjects,
                      last_action=CASE WHEN bills.last_action_date IS NULL THEN excluded.last_action ELSE bills.last_action END,
                      stage=CASE WHEN bills.last_action_date IS NULL THEN excluded.stage ELSE bills.stage END""",
-                (session, e.bill, t, n, e.title, e.last_action, stage, json.dumps(e.subjects), ts, ts),
+                (session, e.bill, t, n, e.title, e.last_action, stage, json.dumps(e.subjects), ts, ts, e.last_action, ts),
             )
             if FTS_TABLE:
                 fts_update(c, session, e.bill)
@@ -591,6 +618,8 @@ def refresh_tracked(session: str | None = None, progress=None) -> int:
         with db() as c:
             c.execute("UPDATE tracked SET last_checked=? WHERE session=? AND bill=?", (now_iso(), r["session"], r["bill"]))
     send_movement_emails()
+    if session in (None, DEFAULT_SESSION):
+        check_watched_texts(progress)  # new versions of tracked or Relevant bills: "what changed?" redlines
     return len(rows)
 
 
@@ -941,7 +970,7 @@ def vapid() -> tuple[str, str]:
 
 
 PUSH_KINDS = {"newbill": "New OneVoice bills", "moved": "Tracked bill moves", "hearing": "Tracked bill on a committee agenda",
-              "press": "Press releases about your bills"}
+              "press": "Press releases about your bills", "changed": "Tracked bill rewritten (what changed)"}
 
 
 def send_push(kind: str, title: str, body: str, url: str = "/", tag: str = "") -> int:
@@ -1269,12 +1298,16 @@ def export_backup() -> dict:
     with db() as c:
         tracked = [dict(r) for r in c.execute("SELECT * FROM tracked ORDER BY session, bill")]
         reviews = [dict(r) for r in c.execute("SELECT * FROM reviews ORDER BY session, bill, priority_id")]
+        goal_log = [dict(r) for r in c.execute("SELECT kind, date, data, created_at, updated_at FROM goal_log ORDER BY id")]
+        goal_meta = {r["key"]: json.loads(r["value"]) for r in c.execute(
+            "SELECT key, value FROM meta WHERE key LIKE 'goal_%'")}
     st = settings()
     return {"app": "OneVoice Tracker", "format": 1, "exported_at": now_iso(),
-            "tracked": tracked, "reviews": reviews, "priorities": get_priorities(),
+            "tracked": tracked, "reviews": reviews, "priorities": get_priorities(), "goal_log": goal_log, "goal_meta": goal_meta,
             "settings": {k: st[k] for k in ("recipients", "alerts_enabled", "app_url", "checkin_enabled",
                                              "checkin_backup", "movement_enabled", "movement_categories",
-                                             "hearing_email", "press_email")}}
+                                             "hearing_email", "press_email", "redline_email", "report_enabled",
+                                             "report_scope", "report_recipients")}}
 
 
 def restore_backup(data: dict) -> dict:
@@ -1282,10 +1315,16 @@ def restore_backup(data: dict) -> dict:
         raise ValueError("This file isn't a OneVoice Tracker backup.")
     with db() as c:
         for t in data.get("tracked", []):
-            c.execute("""INSERT OR REPLACE INTO tracked(session,bill,position,priority,notes,labels,added_at,last_checked)
-                         VALUES(?,?,?,?,?,?,?,?)""",
+            c.execute("""INSERT OR REPLACE INTO tracked(session,bill,position,priority,notes,labels,added_at,last_checked,reason,track)
+                         VALUES(?,?,?,?,?,?,?,?,?,?)""",
                       (t["session"], t["bill"], t.get("position"), t.get("priority"), t.get("notes", ""),
-                       t.get("labels", ""), t.get("added_at") or now_iso(), t.get("last_checked")))
+                       t.get("labels", ""), t.get("added_at") or now_iso(), t.get("last_checked"), t.get("reason", ""), t.get("track", "")))
+        if data.get("goal_log") and not c.execute("SELECT 1 FROM goal_log LIMIT 1").fetchone():
+            c.executemany("INSERT INTO goal_log(kind,date,data,created_at,updated_at) VALUES(?,?,?,?,?)",
+                          [(g["kind"], g["date"], g["data"], g["created_at"], g.get("updated_at")) for g in data["goal_log"]])
+        for k, v in (data.get("goal_meta") or {}).items():
+            if k.startswith("goal_"):
+                c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (k, json.dumps(v)))
         for r in data.get("reviews", []):
             c.execute("INSERT OR REPLACE INTO reviews(session,bill,priority_id,verdict,keywords,at) VALUES(?,?,?,?,?,?)",
                       (r["session"], r["bill"], r["priority_id"], r.get("verdict"), r.get("keywords", "[]"), r.get("at")))
@@ -1372,6 +1411,10 @@ def housekeeping() -> None:
     if _due("canary", 1 if canary.get("ok", True) else 1 / 6):  # re-check after 10 minutes when it failed
         run_canary()
     watch_problems()
+    try:
+        weekly_report_due()
+    except Exception as e:  # noqa: BLE001
+        log_event("weekly_report", False, str(e))
     now_local = datetime.now(CENTRAL)
     today = now_local.date().isoformat()
     if now_local.hour >= CHECKIN_HOUR and meta_get("last_checkin_date") != today:
@@ -1560,8 +1603,8 @@ def security_headers(resp):
 def require_sign_in():
     if not app.secret_key:
         app.secret_key = _secret_key()
-    if request.path in ("/login", "/healthz", "/sw.js", "/manifest.webmanifest") or request.path.startswith(("/r/", "/static/icons/")):
-        return None  # /r/ links carry their own signature; app files hold nothing private
+    if request.path in ("/login", "/healthz", "/sw.js", "/manifest.webmanifest") or request.path.startswith(("/r/", "/cal/", "/static/icons/")):
+        return None  # /r/ and /cal/ links carry their own secret; app files hold nothing private
     if not PASSWORD:
         required = os.environ.get("BILLTRACKER_REQUIRE_PASSWORD", "false") == "true"
         if not required and os.environ.get("HOST", "127.0.0.1") in ("127.0.0.1", "localhost"):
@@ -1855,6 +1898,8 @@ def api_update_tracked(session, bill):
         fields.append("labels=?"); args.append(str(body["labels"])[:500])
     if "reason" in body:
         fields.append("reason=?"); args.append(str(body["reason"])[:1000])
+    if "track" in body:
+        fields.append("track=?"); args.append(str(body["track"]).strip()[:100])
     if not fields:
         abort(400, "Nothing to update.")
     with db() as c:
@@ -1887,7 +1932,13 @@ def api_bill(session, bill):
     with db() as c:
         t = c.execute("SELECT * FROM tracked WHERE session=? AND bill=?", (session, bill)).fetchone()
         b = c.execute("SELECT subjects FROM bills WHERE session=? AND bill=?", (session, bill)).fetchone()
+        reds = [{"id": r["id"], "old": r["old_version"], "new": r["new_version"], "headline": r["headline"], "at": r["at"]}
+                for r in c.execute("SELECT id, old_version, new_version, headline, at FROM redlines WHERE session=? AND bill=? ORDER BY id DESC",
+                                   (session, bill))]
     d.update(
+        redlines=reds,
+        versions=[{"name": v["name"], "url": v["url"]} for v in d.get("documents", []) if v.get("group", "").startswith("Versions of")],
+        track_options=list(dict.fromkeys([p["task_force"] for p in get_priorities()] + EXTRA_TRACKS)),
         display=ok.display_bill(bill),
         stage=ok.stage_from_actions(bill, [ok.Action(**a) for a in d["actions"]]),
         url=ok.bill_url(bill, session),
@@ -2122,8 +2173,17 @@ def api_home():
     for m in mine:
         m["your_bills"] = [ok.display_bill(b) for b in json.loads(m["bills"]) if b in watch]
         m.pop("bills")
+    try:
+        g = compute_goals(GOAL_YEAR)
+        heads = [m for m in g["metrics"] if m["headline"]]
+        goals_line = (f"{sum(1 for m in heads if m['status'] in ('met', 'on_track'))} of {len(heads)} on pace"
+                      if any(m["status"] in ("met", "on_track", "behind") for m in heads) else "")
+        logged = g["counts"]["meetings"]
+    except Exception:  # noqa: BLE001 - the home screen never fails over the goals card
+        goals_line, logged = "", 0
     return jsonify(new_bills=new_bills, to_review=to_review, meetings_this_week=meetings, press_new=press_new,
-                   tracked=tracked, updates=unseen_updates, your_hearings=mine)
+                   tracked=tracked, updates=unseen_updates, your_hearings=mine, goals_line=goals_line,
+                   meetings_logged=logged, goal_year=GOAL_YEAR)
 
 
 @app.get("/api/calendar")
@@ -2475,6 +2535,8 @@ def api_settings():
         action_categories=[{"key": k, "label": v} for k, v in ok.ACTION_CATEGORIES],
         checkin_hour=CHECKIN_HOUR,
         refresh_hours=REFRESH_HOURS,
+        report_hour=REPORT_HOUR,
+        ical=ical_urls(),
     )
 
 
@@ -2493,7 +2555,14 @@ def api_settings_update():
         s["app_url"] = str(body["app_url"]).strip()[:300]
     if body.get("press_email") in ("tracked", "agenda", "off"):
         s["press_email"] = body["press_email"]
-    for key in ("checkin_enabled", "checkin_backup", "movement_enabled", "hearing_email"):
+    if body.get("report_scope") in ("onevoice", "watched"):
+        s["report_scope"] = body["report_scope"]
+    if "report_recipients" in body:
+        addrs, bad = parse_addresses(body["report_recipients"])
+        if bad:
+            abort(400, f"These don't look like email addresses: {', '.join(bad)}")
+        s["report_recipients"] = addrs[:50]
+    for key in ("checkin_enabled", "checkin_backup", "movement_enabled", "hearing_email", "redline_email", "report_enabled"):
         if key in body:
             s[key] = bool(body[key])
     if "movement_categories" in body:
@@ -2563,6 +2632,870 @@ def api_export():
                     d["position"], d.get("reason") or "", d["priority"], d["labels"], d["notes"], d["url"]])
     return Response(buf.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename=onevoice-tracked-bills-{s}.csv"})
+
+
+# ----------------------------------------------------- "what changed?" redlines
+
+
+def bill_keywords(session: str, bill: str) -> list[str]:
+    """Keywords of the OneVoice priorities a bill matches (for 'now mentions / no longer mentions')."""
+    pri = {p["id"]: p for p in get_priorities()}
+    with db() as c:
+        ids = [r["priority_id"] for r in c.execute("SELECT priority_id FROM matches WHERE session=? AND bill=?", (session, bill))]
+    return sorted({k for i in ids if i in pri for k in pri[i]["keywords"]})
+
+
+def record_redline(session, bill, old_version, old_url, old_text, new_version, new_url, new_text) -> None:
+    d = rl.diff(old_text, new_text)
+    if not d["changes"]:
+        return
+    kc = rl.keyword_changes(old_text, new_text, bill_keywords(session, bill))
+    d["changes"] = d["changes"][:80]
+    watched = bill in watched_bills(session)
+    with db() as c:
+        c.execute("""INSERT INTO redlines(session,bill,old_version,old_url,new_version,new_url,old_body,headline,diff,keywords,at,emailed)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (session, bill, old_version, old_url, new_version, new_url, zlib.compress(old_text.encode("utf-8")),
+                   rl.headline(d), json.dumps(d), json.dumps(kc), now_iso(), 0 if watched else 2))
+    log_event("redline", True, bill=bill, watched=watched)
+
+
+def send_redline_emails() -> int:
+    st = settings()
+    with db() as c:
+        rows = c.execute("""SELECT r.*, b.title FROM redlines r LEFT JOIN bills b ON b.session=r.session AND b.bill=r.bill
+                            WHERE r.emailed=0 ORDER BY r.id""").fetchall()
+    sent = 0
+    for r in rows:
+        d, kc = json.loads(r["diff"]), json.loads(r["keywords"] or "{}")
+        item = {"session": r["session"], "bill": r["bill"], "display": ok.display_bill(r["bill"]), "title": r["title"] or "",
+                "url": ok.bill_url(r["bill"], r["session"]), "link": r["new_url"], "old_version": r["old_version"] or "Earlier version",
+                "new_version": r["new_version"] or "New version", "headline": r["headline"],
+                "changes_html": rl.changes_html(d), "changes_text": rl.changes_text(d),
+                "gained": kc.get("gained", []), "lost": kc.get("lost", [])}
+        delivered = _try_send(st, *ov.render_redline(item, st["app_url"])) if st.get("redline_email", True) else False
+        pushed = send_push("changed", f"{item['display']} was rewritten", f"{item['new_version']}: {r['headline']}"[:180],
+                           f"/#bill-{r['session']}-{r['bill']}", tag=f"changed-{r['bill']}")
+        if delivered or pushed or not ov.email_configured() or not st.get("redline_email", True):
+            with db() as c:
+                c.execute("UPDATE redlines SET emailed=1 WHERE id=?", (r["id"],))
+            sent += 1
+    return sent
+
+
+def check_watched_texts(progress=None) -> int:
+    """Download the newest text of every tracked or Relevant bill whose version changed (redlines follow)."""
+    n = 0
+    watch = watched_bills(DEFAULT_SESSION)
+    for i, bill in enumerate(sorted(watch), 1):
+        if progress:
+            progress(i, len(watch), ok.display_bill(bill) + " text")
+        try:
+            get_text(DEFAULT_SESSION, bill)
+            n += 1
+        except Exception:  # noqa: BLE001 - try again on the next run
+            continue
+    send_redline_emails()
+    return n
+
+
+# ------------------------------------------------------------ session scoreboard
+
+
+def onevoice_bills(session: str) -> dict[str, list[str]]:
+    """{bill: [priority ids]} for agenda matches not marked Not relevant."""
+    out: dict[str, list[str]] = {}
+    with db() as c:
+        for r in c.execute("""SELECT m.bill, m.priority_id FROM matches m LEFT JOIN reviews rv ON rv.session=m.session
+                              AND rv.bill=m.bill AND rv.priority_id=m.priority_id
+                              WHERE m.session=? AND COALESCE(rv.verdict,'')!='not_relevant'""", (session,)):
+            out.setdefault(r["bill"], []).append(r["priority_id"])
+    return out
+
+
+def scoreboard(session: str) -> dict:
+    pri = {p["id"]: p for p in get_priorities()}
+    ovb = onevoice_bills(session)
+    with db() as c:
+        bills = {r["bill"]: dict(r) for r in c.execute(
+            "SELECT bill, title, stage, last_action, last_action_date, author FROM bills WHERE session=?", (session,))}
+        tracked = {r["bill"]: dict(r) for r in c.execute("SELECT bill, position, reason FROM tracked WHERE session=?", (session,))}
+        relevant = {r["bill"] for r in c.execute("SELECT DISTINCT bill FROM reviews WHERE session=? AND verdict='relevant'", (session,))}
+    closed = ok.session_closed(session)
+    tf_order = list(dict.fromkeys(p["task_force"] for p in pri.values()))
+    by_tf = {tf: set() for tf in tf_order}
+    for b, ids in ovb.items():
+        for i in ids:
+            if i in pri:
+                by_tf[pri[i]["task_force"]].add(b)
+    rank = {k: i for i, (k, _) in enumerate(ok.STAGES)}
+    reached = [0] * len(ok.STAGES)
+    for b in ovb:
+        st = (bills.get(b) or {}).get("stage") or "introduced"
+        r = rank.get(st, rank["governor"] if st == "vetoed" else 0)
+        for k in range(r + 1):
+            reached[k] += 1
+    positions = {p: 0 for p in ("support", "neutral", "monitor", "oppose")}
+    for t in tracked.values():
+        if t["position"] in positions:
+            positions[t["position"]] += 1
+    wins, losses = [], []
+    for b, t in tracked.items():
+        st = (bills.get(b) or {}).get("stage") or "unknown"
+        row = {"bill": b, "display": ok.display_bill(b), "title": (bills.get(b) or {}).get("title") or "",
+               "position": t["position"], "stage_label": ok.STAGE_LABEL.get(st, st), "onevoice": b in ovb}
+        if t["position"] == "support" and st == "law":
+            wins.append({**row, "why": "Supported and signed into law"})
+        elif t["position"] == "oppose" and (st in ("vetoed", "failed") or (closed and st != "law")):
+            wins.append({**row, "why": "Opposed and stopped"})
+        elif t["position"] == "oppose" and st == "law":
+            losses.append({**row, "why": "Opposed but became law"})
+        elif t["position"] == "support" and (st in ("vetoed", "failed") or (closed and st != "law")):
+            losses.append({**row, "why": "Supported but did not pass"})
+    supported = [b for b, t in tracked.items() if t["position"] == "support"]
+    enacted_support = sum(1 for b in supported if (bills.get(b) or {}).get("stage") == "law")
+    return {
+        "session": session, "session_name": session_name(session), "closed": closed,
+        "kpis": {"onevoice": len(ovb), "relevant": len(relevant), "tracked": len(tracked),
+                 "with_position": sum(1 for t in tracked.values() if t["position"] != "monitor"),
+                 "enacted": sum(1 for b in ovb if (bills.get(b) or {}).get("stage") == "law"),
+                 "supported": len(supported), "supported_enacted": enacted_support,
+                 "win_rate": round(100 * enacted_support / len(supported)) if supported else None},
+        "by_task_force": [{"task_force": tf, "count": len(by_tf[tf])} for tf in tf_order],
+        "funnel": [{"stage": k, "label": lbl, "count": reached[i]} for i, (k, lbl) in enumerate(ok.STAGES)],
+        "positions": [{"position": p, "count": n} for p, n in positions.items()],
+        "wins": sorted(wins, key=lambda w: w["bill"]), "losses": sorted(losses, key=lambda w: w["bill"]),
+    }
+
+
+# ------------------------------------------------------ calendar feed (Outlook)
+
+
+def ical_token(new: bool = False) -> str:
+    tok = meta_get("ical_token")
+    if new or not tok:
+        tok = secrets.token_urlsafe(18)
+        meta_set("ical_token", tok)
+    return tok
+
+
+def _ics_escape(s: str) -> str:
+    return (s or "").replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,").replace("\r", "").replace("\n", "\\n")
+
+
+def _ics_fold(line: str) -> str:
+    out, b = [], line.encode("utf-8")
+    while len(b) > 74:
+        cut = 74
+        while cut > 0 and (b[cut] & 0xC0) == 0x80:  # don't split a UTF-8 character
+            cut -= 1
+        out.append(b[:cut].decode("utf-8"))
+        b = b" " + b[cut:]
+    out.append(b.decode("utf-8"))
+    return "\r\n".join(out)
+
+
+VTIMEZONE = """BEGIN:VTIMEZONE
+TZID:America/Chicago
+BEGIN:DAYLIGHT
+TZOFFSETFROM:-0600
+TZOFFSETTO:-0500
+TZNAME:CDT
+DTSTART:19700308T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0600
+TZNAME:CST
+DTSTART:19701101T020000
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU
+END:STANDARD
+END:VTIMEZONE"""
+
+
+def meeting_end(start: datetime, time_text: str) -> datetime:
+    m = re.search(r"-\s*(\d{1,2}:\d{2}\s*[AP]M)", time_text or "", re.I)
+    if m:
+        try:
+            t = datetime.strptime(m.group(1).upper().replace(" ", ""), "%I:%M%p")
+            end = start.replace(hour=t.hour, minute=t.minute)
+            if end > start:
+                return end
+        except ValueError:
+            pass
+    return start + timedelta(hours=1)
+
+
+def build_ics(session: str, everything: bool) -> str:
+    watch = watched_bills(session)
+    ovb = onevoice_bills(session)
+    lo = (datetime.now(CENTRAL) - timedelta(days=60)).replace(tzinfo=None).isoformat()
+    with db() as c:
+        meetings = [dict(r) for r in c.execute("SELECT * FROM meetings WHERE start>=? ORDER BY start", (lo,))]
+        dls = [dict(r) for r in c.execute("SELECT date, label FROM deadlines WHERE date>=?", (lo[:10],))]
+        titles = {r["bill"]: r["title"] for r in c.execute("SELECT bill, title FROM bills WHERE session=?", (session,))}
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Tulsa Regional Chamber//OneVoice Tracker//EN", "CALSCALE:GREGORIAN",
+             "METHOD:PUBLISH", "X-WR-CALNAME:" + ("OneVoice: all committee meetings" if everything else "OneVoice hearings"),
+             "X-WR-TIMEZONE:America/Chicago", "X-PUBLISHED-TTL:PT1H", "REFRESH-INTERVAL;VALUE=DURATION:PT1H"] + VTIMEZONE.split("\n")
+    for m in meetings:
+        if not m["start"]:
+            continue
+        bills = json.loads(m["bills"] or "[]")
+        mine = [b for b in bills if b in watch or b in ovb]
+        if not everything and not mine:
+            continue
+        start = datetime.fromisoformat(m["start"])
+        end = meeting_end(start, m["time_text"])
+        cancelled = bool(re.search(r"cancel", f"{m['status']} {m['title']}", re.I))
+        summary = f"{m['chamber']} {m['committee']}"
+        if mine:
+            summary += ": " + ", ".join(ok.display_bill(b) for b in mine[:6]) + (" +" if len(mine) > 6 else "")
+        if cancelled:
+            summary = "CANCELED: " + summary
+        desc = []
+        for b in bills:
+            tag = " [tracked]" if watch.get(b) == "tracked" else " [Relevant]" if b in watch else " [OneVoice]" if b in ovb else ""
+            desc.append(f"{ok.display_bill(b)}{tag}: {titles.get(b) or ''}".strip())
+        if m["agenda_url"]:
+            desc.append("")
+            desc.append("Agenda: " + m["agenda_url"])
+        if m["page_url"]:
+            desc.append("Meeting page and video: " + m["page_url"])
+        ev = ["BEGIN:VEVENT", f"UID:{m['key']}@onevoice-tracker", f"DTSTAMP:{stamp}",
+              f"DTSTART;TZID=America/Chicago:{start.strftime('%Y%m%dT%H%M%S')}",
+              f"DTEND;TZID=America/Chicago:{end.strftime('%Y%m%dT%H%M%S')}",
+              "SUMMARY:" + _ics_escape(summary), "LOCATION:" + _ics_escape(m["location"] or "Oklahoma State Capitol"),
+              "DESCRIPTION:" + _ics_escape("\n".join(desc) or "No agenda posted yet."),
+              f"STATUS:{'CANCELLED' if cancelled else 'CONFIRMED'}", "TRANSP:OPAQUE"]
+        if m["agenda_url"] or m["page_url"]:
+            ev.append("URL:" + (m["agenda_url"] or m["page_url"]))
+        lines += ev + ["END:VEVENT"]
+    for d in dls:
+        day = d["date"].replace("-", "")
+        nxt = (datetime.fromisoformat(d["date"]) + timedelta(days=1)).strftime("%Y%m%d")
+        uid = hashlib_hex(f"{d['date']}{d['label']}")
+        lines += ["BEGIN:VEVENT", f"UID:deadline-{uid}@onevoice-tracker", f"DTSTAMP:{stamp}", f"DTSTART;VALUE=DATE:{day}",
+                  f"DTEND;VALUE=DATE:{nxt}", "SUMMARY:" + _ics_escape("Legislature: " + d["label"]), "TRANSP:TRANSPARENT", "END:VEVENT"]
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(_ics_fold(x) for x in lines) + "\r\n"
+
+
+def hashlib_hex(s: str) -> str:
+    import hashlib
+    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:16]
+
+
+# ------------------------------------------------------- weekly Members report
+
+REPORT_HOUR = int(os.environ.get("BILLTRACKER_REPORT_HOUR", "12"))  # Friday report email, Central time
+EXTRA_TRACKS = ["Criminal Justice", "Tax Reform", "Education", "Other"]
+
+
+def week_bounds(day: str | None) -> tuple[datetime, datetime]:
+    """Monday 00:00 and next Monday for the week containing `day` (default: this week)."""
+    try:
+        d = datetime.fromisoformat(day) if day else datetime.now(CENTRAL).replace(tzinfo=None)
+    except ValueError:
+        d = datetime.now(CENTRAL).replace(tzinfo=None)
+    mon = (d - timedelta(days=d.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    return mon, mon + timedelta(days=7)
+
+
+def report_rows(session: str, week: str | None, scope: str = "onevoice") -> tuple[datetime, list[dict]]:
+    """Bills with action in the week: OneVoice matches (not marked Not relevant) and tracked bills,
+    or only tracked and Relevant bills (scope='watched')."""
+    mon, nxt = week_bounds(week)
+    pri = get_priorities()
+    order = {p["id"]: i for i, p in enumerate(pri)}
+    tf = {p["id"]: p["task_force"] for p in pri}
+    ovb = onevoice_bills(session)
+    watch = watched_bills(session)
+    with db() as c:
+        tracks = {r["bill"]: r["track"] for r in c.execute("SELECT bill, track FROM tracked WHERE session=?", (session,))}
+        rows = c.execute("""SELECT b.bill, b.bill_num, b.title, b.last_action, b.last_action_date, b.moved_at, b.author, s.summary, d.data AS detail
+                            FROM bills b LEFT JOIN summaries s ON s.session=b.session AND s.bill=b.bill
+                            LEFT JOIN details d ON d.session=b.session AND d.bill=b.bill
+                            WHERE b.session=? AND (b.last_action_date>=? OR b.moved_at>=?)""",
+                         (session, mon.date().isoformat(), (mon - timedelta(days=1)).date().isoformat())).fetchall()
+    lo, hi = mon.date().isoformat(), nxt.date().isoformat()
+    out = []
+    for r in rows:
+        b = r["bill"]
+        if not (b in watch or b in tracks if scope == "watched" else b in ovb or b in tracks):
+            continue
+        when, what = r["last_action_date"], r["last_action"]
+        if not (lo <= (when or "") < hi):
+            # moved again since: use the bill's saved history to find its last action within the week
+            acts = [a for a in (json.loads(r["detail"]).get("actions", []) if r["detail"] else []) if lo <= (a.get("date") or "") < hi]
+            if not acts:
+                moved = r["moved_at"] and datetime.fromisoformat(r["moved_at"]).astimezone(CENTRAL).date().isoformat()
+                if not moved or not (lo <= moved < hi) or (when or "") > moved:
+                    continue
+                acts = [{"date": moved, "action": what}]  # the index saw it move this week; dates firm up when the bill is re-read
+            last = sorted(acts, key=lambda a: a["date"])[-1]
+            when, what = last["date"], last["action"]
+        ids = sorted(ovb.get(b, []), key=lambda i: order.get(i, 99))
+        track = (tracks.get(b) or "").strip() or (tf.get(ids[0]) if ids else "") or "Other"
+        out.append({"bill": b, "display": ok.display_bill(b), "num": r["bill_num"] or 0, "track": track,
+                    "summary": r["summary"] or r["title"] or "", "date": when, "last_action": what or "",
+                    "author": r["author"] or "", "url": ok.bill_url(b, session)})
+    out.sort(key=lambda x: (-int(x["date"].replace("-", "")), x["track"], x["num"]))
+    return mon, out
+
+
+def prepare_report(session: str, week: str | None, progress=None) -> dict:
+    """Re-read every bill on the week's report from oklegislature.gov so its last action and date are exact."""
+    _, rows = report_rows(session, week, "onevoice")
+    for i, r in enumerate(rows, 1):
+        if progress:
+            progress(i, len(rows), r["display"])
+        try:
+            get_detail(session, r["bill"], refresh=True)
+        except RuntimeError:
+            continue
+    meta_set("report_prepared", {"at": now_iso(), "week": week_bounds(week)[0].date().isoformat(), "count": len(rows)})
+    return {"bills": len(rows)}
+
+
+def report_label(mon: datetime) -> str:
+    return f"Week of {mon.month}/{mon.day}/{mon.year}"
+
+
+def report_filename(mon: datetime) -> str:
+    return f"Bill_Track_Week_of_{mon.month}.{mon.day}.xlsx"
+
+
+def report_xlsx(rows: list[dict]) -> bytes:
+    """Same layout as the team's weekly sheet: Track, Bill Information, AI Summary, Last Action Date."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Bill Track"
+    head = ["Track", "Bill Information", "AI Summary", "Last Action Date"]
+    ws.append(head)
+    thin = Side(style="thin", color="D0D5CC")
+    for i, _ in enumerate(head, 1):
+        cell = ws.cell(1, i)
+        cell.font = Font(bold=True, size=12)
+        cell.fill = PatternFill("solid", fgColor="FFFFFF")
+        cell.alignment = Alignment(wrap_text=True, vertical="center")
+        cell.border = Border(bottom=Side(style="medium", color="5A9A28"))
+    for r in rows:
+        ws.append([r["track"], r["display"], r["summary"], datetime.fromisoformat(r["date"])])
+        n = ws.max_row
+        link = ws.cell(n, 2)
+        link.hyperlink = r["url"]
+        link.font = Font(color="0563C1", underline="single")
+        ws.cell(n, 4).number_format = "mm-dd-yy"
+        for col in range(1, 5):
+            c = ws.cell(n, col)
+            c.alignment = Alignment(wrap_text=True, vertical="top")
+            c.border = Border(bottom=thin)
+    for col, w in zip("ABCD", (41.27, 22.18, 78.82, 21.45)):
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = f"A1:D{max(ws.max_row, 1)}"
+    ws.print_title_rows = "1:1"
+    ws.page_setup.orientation = "landscape"
+    ws.page_setup.fitToWidth = 1
+    ws.page_setup.fitToHeight = 0
+    ws.sheet_properties.pageSetUpPr.fitToPage = True
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+def send_weekly_report(week: str | None = None, to: list[str] | None = None, force: bool = False) -> dict:
+    st = settings()
+    mon, rows = report_rows(DEFAULT_SESSION, week, st.get("report_scope", "onevoice"))
+    if not rows and not force:
+        return {"sent": False, "count": 0, "reason": "No bills had action this week."}
+    recips = to or st.get("report_recipients") or st["recipients"]
+    if not recips or not ov.email_configured():
+        return {"sent": False, "count": len(rows), "reason": "Email isn't set up, or there is no one to send to."}
+    subject, text, html_body = ov.render_weekly_report(report_label(mon), len(rows), st["app_url"])
+    att = [(report_filename(mon), report_xlsx(rows), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")]
+    try:
+        ov.send_email(recips, subject, text, html_body, attachments=att)
+    except Exception as e:  # noqa: BLE001
+        log_event("weekly_report", False, str(e))
+        return {"sent": False, "count": len(rows), "reason": f"The email didn't send: {e}"}
+    log_event("weekly_report", True, count=len(rows))
+    return {"sent": True, "count": len(rows), "to": recips}
+
+
+def weekly_report_due() -> None:
+    """Fridays at REPORT_HOUR Central: email the week's report (only when bills moved)."""
+    now_local = datetime.now(CENTRAL)
+    if now_local.weekday() != 4 or now_local.hour < REPORT_HOUR or not settings().get("report_enabled", True):
+        return
+    mon, _ = week_bounds(None)
+    if meta_get("last_weekly_report") == mon.date().isoformat():
+        return
+    meta_set("last_weekly_report", mon.date().isoformat())
+    prepare_report(DEFAULT_SESSION, None)
+    send_weekly_report()
+
+
+# ---------------------------------------------------------------- 2027 goals
+
+GOAL_OWNER = "Katie Henke"
+GOALS = [
+    {"n": 1, "title": "Advance the OneVoice agenda", "text": "Advance OneVoice legislative priorities at the state and federal levels."},
+    {"n": 2, "title": "Strengthen relationships with policy leaders", "text": "Grow face-to-face engagement with elected officials and policy leaders at every level of government."},
+    {"n": 3, "title": "Grow the Chamber's political action committees", "text": "Grow donors and board engagement for OklahomaBizPac and TulsaBizPac and prepare for 2028."},
+]
+ACTIVITY_TYPES = {
+    "roundtable": "Policy briefing or roundtable",
+    "coalition": "Coalition update or call to action",
+    "federal": "Federal advocacy initiative (e.g., DC Fly-In)",
+    "ballot": "Ballot initiative analysis",
+    "quarterly_report": "Quarterly policy progress report",
+    "pac_board": "PAC board meeting",
+    "forum": "PAC forum or candidate event",
+    "pac_review": "PAC fundraising goals review",
+}
+PACS = ["OklahomaBizPac", "TulsaBizPac"]
+LEVELS = {"local": "Municipal / county", "state": "State", "federal": "Federal", "other": "Other policy leader"}
+DEFAULT_TARGETS = {
+    "bills_passed": 10, "coverage": 100, "coalition": 4, "federal": 2, "ballot_designated": 0, "quarterly_report": 4,
+    "contacts": 150, "contacts_local": 45, "contacts_state": 75, "contacts_federal": 30, "distinct": 50, "roundtable": 6,
+    "donors": 75, "pac_board": 4, "attendance": 80, "forum": 2,
+}
+QUARTERLY = {"contacts": [40, 85, 120, 150], "donors": [15, 35, 55, 75]}  # cumulative by quarter end
+MILESTONES = [
+    ("g1q1a", 1, 1, "Finalize the OneVoice agenda"), ("g1q1b", 1, 1, "Bill tracking and monitoring in place"),
+    ("g1q1c", 1, 1, "Launch state advocacy for the session"),
+    ("g1q2a", 1, 2, "Complete session advocacy"), ("g1q2b", 1, 2, "Document legislative outcomes"),
+    ("g1q2c", 1, 2, "Advance federal priorities (DC Fly-In)"), ("g1q2d", 1, 2, "Assess local initiatives"),
+    ("g1q3a", 1, 3, "Prepare the next OneVoice cycle"), ("g1q3b", 1, 3, "Interim engagement with legislators"),
+    ("g1q3c", 1, 3, "Develop positions on emerging issues"),
+    ("g1q4a", 1, 4, "Finalize 2028 OneVoice priorities"), ("g1q4b", 1, 4, "Annual report"), ("g1q4c", 1, 4, "Set next year's strategy"),
+    ("g2q1", 2, 1, "Q1 contact review"), ("g2q2", 2, 2, "Q2 contact review"), ("g2q3", 2, 3, "Q3 contact review"), ("g2q4", 2, 4, "Q4 contact review"),
+    ("g3q1", 3, 1, "Q1 PAC fundraising review"), ("g3q2", 3, 2, "Q2 PAC fundraising review"),
+    ("g3plan", 3, 3, "2028 election readiness plan (due Sept. 30)"), ("g3q3", 3, 3, "Q3 PAC fundraising review"),
+    ("g3q4", 3, 4, "Q4 PAC fundraising review"),
+]
+GOAL_YEAR = int(os.environ.get("BILLTRACKER_GOAL_YEAR", "2027"))
+
+
+def goal_targets() -> dict:
+    return {**DEFAULT_TARGETS, **(meta_get("goal_targets") or {})}
+
+
+def year_fraction(year: int, quarterly: list[int] | None, target: float) -> float:
+    """How much of `target` should be done by today, from quarterly targets or evenly through the year."""
+    today = datetime.now(CENTRAL).date()
+    start, end = datetime(year, 1, 1).date(), datetime(year + 1, 1, 1).date()
+    if today < start:
+        return 0
+    if today >= end:
+        return target
+    if quarterly:
+        q = (today.month - 1) // 3
+        qs = datetime(year, q * 3 + 1, 1).date()
+        qe = datetime(year + (q == 3), (q * 3 + 3) % 12 + 1, 1).date()
+        prev = quarterly[q - 1] if q else 0
+        return prev + (quarterly[q] - prev) * (today - qs).days / (qe - qs).days
+    return target * (today - start).days / (end - start).days
+
+
+def goal_entries(year: int, kind: str | None = None) -> list[dict]:
+    with db() as c:
+        q = "SELECT * FROM goal_log WHERE date>=? AND date<?" + (" AND kind=?" if kind else "") + " ORDER BY date DESC, id DESC"
+        args = [f"{year}-01-01", f"{year + 1}-01-01"] + ([kind] if kind else [])
+        rows = c.execute(q, args).fetchall()
+    return [{"id": r["id"], "kind": r["kind"], "date": r["date"], **json.loads(r["data"] or "{}")} for r in rows]
+
+
+def people_of(entry: dict) -> list[str]:
+    return [p.strip() for p in re.split(r"[\n;]+", entry.get("people") or "") if p.strip()]
+
+
+def goal_bills(session: str) -> list[dict]:
+    """OneVoice-aligned bills that became law: matched (not marked Not relevant), supported or marked Relevant,
+    plus any added by hand, minus any taken out by hand."""
+    ovb = onevoice_bills(session)
+    over = meta_get(f"goal_bills:{session}") or {}
+    with db() as c:
+        law = {r["bill"]: r["title"] for r in c.execute("SELECT bill, title FROM bills WHERE session=? AND stage='law'", (session,))}
+        support = {r["bill"] for r in c.execute("SELECT bill FROM tracked WHERE session=? AND position='support'", (session,))}
+        relevant = {r["bill"] for r in c.execute("SELECT DISTINCT bill FROM reviews WHERE session=? AND verdict='relevant'", (session,))}
+    out = []
+    for b, title in law.items():
+        auto = b in ovb and (b in support or b in relevant)
+        choice = over.get(b)
+        if choice is True or (auto and choice is not False):
+            out.append({"bill": b, "display": ok.display_bill(b), "title": title or "", "auto": auto, "added": choice is True and not auto})
+    return sorted(out, key=lambda x: x["bill"])
+
+
+def compute_goals(year: int) -> dict:
+    t = goal_targets()
+    session = f"{str(year)[2:]}00"
+    entries = goal_entries(year)
+    meets = [e for e in entries if e["kind"] == "meeting" and e.get("in_person", True)]
+    donors = [e for e in entries if e["kind"] == "donor"]
+    acts = [e for e in entries if e["kind"] == "activity"]
+    contacts = sum(len(people_of(m)) or 1 for m in meets)
+    by_level = {k: sum(len(people_of(m)) or 1 for m in meets if m.get("level") == k) for k in LEVELS}
+    distinct = {p.lower() for m in meets for p in people_of(m)}
+    nact = lambda typ: sum(1 for a in acts if a.get("type") == typ)  # noqa: E731
+    board = {p: sum(1 for a in acts if a.get("type") == "pac_board" and a.get("pac") == p) for p in PACS}
+    att = [float(a["attendance"]) for a in acts if a.get("type") == "pac_board" and str(a.get("attendance") or "").strip()]
+    att_avg = round(sum(att) / len(att)) if att else None
+    gb = goal_bills(session)
+    with db() as c:
+        relevant = {r["bill"] for r in c.execute("SELECT DISTINCT bill FROM reviews WHERE session=? AND verdict='relevant'", (session,))}
+        tracked = {r["bill"] for r in c.execute("SELECT bill FROM tracked WHERE session=?", (session,))}
+    coverage = round(100 * len(relevant & tracked) / len(relevant)) if relevant else None
+    done = meta_get(f"goal_milestones:{year}") or {}
+
+    def metric(mid, goal, label, value, target, headline=False, quarterly=None, unit="", note="", pace=True):
+        exp = year_fraction(year, quarterly, target) if pace and target else None
+        if target in (None, 0) or value is None:
+            status = "info"
+        elif value >= target:
+            status = "met"
+        elif exp is None:
+            status = "open"
+        elif exp == 0:
+            status = "upcoming"
+        elif value >= exp * 0.9:
+            status = "on_track"
+        else:
+            status = "behind"
+        return {"id": mid, "goal": goal, "label": label, "value": value, "target": target, "unit": unit, "headline": headline,
+                "expected": round(exp, 1) if exp is not None else None, "status": status, "note": note,
+                "quarterly": quarterly}
+
+    m = [
+        metric("bills_passed", 1, "OneVoice-aligned bills passed", len(gb), t["bills_passed"], True, pace=False,
+               note="Bills that match the agenda, that you supported or marked Relevant, and that became law."),
+        metric("coverage", 1, "Priority bills tracked", coverage, t["coverage"], unit="%", pace=False,
+               note=f"{len(relevant & tracked)} of {len(relevant)} bills marked Relevant are on the tracking list." if relevant else "Mark bills Relevant to measure this."),
+        metric("coalition", 1, "Coalition updates / calls to action", nact("coalition"), t["coalition"]),
+        metric("federal", 1, "Federal advocacy initiatives", nact("federal"), t["federal"]),
+        metric("ballot", 1, "Ballot initiative analyses", nact("ballot"), t["ballot_designated"] or None, pace=False,
+               note="Set the number of designated initiatives under Edit targets." if not t["ballot_designated"] else ""),
+        metric("quarterly_report", 1, "Quarterly advocacy reports", nact("quarterly_report"), t["quarterly_report"], True,
+               quarterly=[1, 2, 3, 4]),
+        metric("contacts", 2, "Face-to-face contacts", contacts, t["contacts"], True, QUARTERLY["contacts"]),
+        metric("contacts_local", 2, "Municipal and county", by_level["local"], t["contacts_local"]),
+        metric("contacts_state", 2, "State", by_level["state"], t["contacts_state"]),
+        metric("contacts_federal", 2, "Federal", by_level["federal"], t["contacts_federal"]),
+        metric("distinct", 2, "Distinct policy leaders", len(distinct), t["distinct"], True),
+        metric("roundtable", 2, "Policy briefings and roundtables", nact("roundtable"), t["roundtable"], True),
+        metric("donors", 3, "PAC donors, new or reactivated", len(donors), t["donors"], True, QUARTERLY["donors"],
+               note=" · ".join(f"{p}: {sum(1 for d in donors if d.get('pac') == p)}" for p in PACS)),
+        metric("pac_board_ok", 3, "OklahomaBizPac board meetings", board["OklahomaBizPac"], t["pac_board"]),
+        metric("pac_board_tu", 3, "TulsaBizPac board meetings", board["TulsaBizPac"], t["pac_board"]),
+        metric("attendance", 3, "Average PAC board attendance", att_avg, t["attendance"], unit="%", pace=False),
+        metric("forum", 3, "PAC forums", nact("forum"), t["forum"]),
+    ]
+    today = datetime.now(CENTRAL).date()
+    ms = []
+    for mid, goal, q, label in MILESTONES:
+        due = datetime(year, q * 3, 30 if q * 3 in (6, 9) else 31).date()
+        if mid == "g3plan":
+            due = datetime(year, 9, 30).date()
+        ms.append({"id": mid, "goal": goal, "quarter": q, "label": label, "due": due.isoformat(),
+                   "done": done.get(mid), "late": not done.get(mid) and today > due})
+    return {"year": year, "owner": GOAL_OWNER, "goals": GOALS, "metrics": m, "milestones": ms, "targets": t,
+            "bills": gb, "session": session, "activity_types": ACTIVITY_TYPES, "pacs": PACS, "levels": LEVELS,
+            "counts": {"meetings": sum(1 for e in entries if e["kind"] == "meeting"), "donors": len(donors), "activities": len(acts)}}
+
+
+def clean_entry(kind: str, body: dict) -> tuple[str, dict]:
+    date = str(body.get("date") or "")[:10]
+    try:
+        datetime.fromisoformat(date)
+    except ValueError:
+        abort(400, "Pick a date.")
+    s = lambda k, n=2000: str(body.get(k) or "").strip()[:n]  # noqa: E731
+    if kind == "meeting":
+        if not s("people") and not s("entity"):
+            abort(400, "Add who you met with.")
+        data = {"people": s("people", 1000), "entity": s("entity", 300), "level": body.get("level") if body.get("level") in LEVELS else "state",
+                "staff": s("staff", 300), "issues": s("issues", 500), "overview": s("overview", 8000), "follow_up": s("follow_up", 2000),
+                "in_person": bool(body.get("in_person", True)), "bills": [b for b in (ok.normalize_bill(x) for x in re.split(r"[,;\n]+", s("bills", 300)) if x.strip()) if b]}
+    elif kind == "donor":
+        if not s("name"):
+            abort(400, "Add the donor's name.")
+        data = {"name": s("name", 200), "pac": body.get("pac") if body.get("pac") in PACS else PACS[0],
+                "status": "reactivated" if body.get("status") == "reactivated" else "new", "amount": s("amount", 30), "notes": s("notes", 1000)}
+    elif kind == "activity":
+        if body.get("type") not in ACTIVITY_TYPES:
+            abort(400, "Pick what kind of activity this was.")
+        data = {"type": body["type"], "title": s("title", 300), "pac": body.get("pac") if body.get("pac") in PACS else "",
+                "attendance": s("attendance", 5), "notes": s("notes", 4000)}
+    else:
+        abort(400, "Unknown kind.")
+    return date, data
+
+
+def goals_xlsx(year: int) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Font
+    g = compute_goals(year)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Scorecard"
+    ws.append([f"{year} Government Affairs goals", "", "", f"Owner: {g['owner']}", f"As of {datetime.now(CENTRAL):%b %-d, %Y}"])
+    ws.append([])
+    ws.append(["Goal", "Measure", "Result", "Target", "Status"])
+    for m in g["metrics"]:
+        ws.append([m["goal"], m["label"], "" if m["value"] is None else f"{m['value']}{m['unit']}",
+                   "" if not m["target"] else f"{m['target']}{m['unit']}", m["status"].replace("_", " ")])
+    ws.append([])
+    ws.append(["Goal", "Milestone", "Quarter", "Due", "Done"])
+    for x in g["milestones"]:
+        ws.append([x["goal"], x["label"], f"Q{x['quarter']}", x["due"], (x["done"] or {}).get("at", "")[:10] if x["done"] else ""])
+    sheets = [
+        ("Meetings", "meeting", ["Date", "Who met", "Organization / office", "Level", "Chamber staff", "Issues", "Overview", "Follow-up", "In person", "Bills"],
+         lambda e: [e["date"], e.get("people"), e.get("entity"), LEVELS.get(e.get("level"), ""), e.get("staff"), e.get("issues"),
+                    e.get("overview"), e.get("follow_up"), "Yes" if e.get("in_person", True) else "No", ", ".join(ok.display_bill(b) for b in e.get("bills", []))]),
+        ("PAC donors", "donor", ["Date", "Donor", "PAC", "New or reactivated", "Amount", "Notes"],
+         lambda e: [e["date"], e.get("name"), e.get("pac"), e.get("status"), e.get("amount"), e.get("notes")]),
+        ("Activities", "activity", ["Date", "Type", "Title", "PAC", "Board attendance %", "Notes"],
+         lambda e: [e["date"], ACTIVITY_TYPES.get(e.get("type"), ""), e.get("title"), e.get("pac"), e.get("attendance"), e.get("notes")]),
+    ]
+    for title, kind, head, fn in sheets:
+        s = wb.create_sheet(title)
+        s.append(head)
+        for e in reversed(goal_entries(year, kind)):
+            s.append(fn(e))
+        s.freeze_panes = "A2"
+        for col in s.columns:
+            s.column_dimensions[col[0].column_letter].width = 18
+    for s in wb.worksheets:
+        for cell in s[3 if s.title == "Scorecard" else 1]:
+            cell.font = Font(bold=True)
+        for row in s.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.column_dimensions["B"].width = 44
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ------------------------------------------------- routes for the features above
+
+
+@app.get("/api/scoreboard")
+def api_scoreboard():
+    return jsonify(scoreboard(want_session()))
+
+
+@app.get("/cal/<token>.ics")
+def ical_feed(token):
+    if not hmac.compare_digest(token, ical_token()):
+        abort(404)
+    body = build_ics(DEFAULT_SESSION, request.args.get("all") == "1")
+    return Response(body, mimetype="text/calendar", headers={"Cache-Control": "no-cache",
+                                                             "Content-Disposition": "inline; filename=onevoice-hearings.ics"})
+
+
+def ical_urls(new: bool = False) -> dict:
+    base = (settings()["app_url"] or request.host_url).rstrip("/")
+    tok = ical_token(new)
+    url = f"{base}/cal/{tok}.ics"
+    return {"hearings": url, "all": url + "?all=1",
+            "webcal": url.replace("https://", "webcal://").replace("http://", "webcal://")}
+
+
+@app.get("/api/ical")
+def api_ical():
+    return jsonify(ical_urls())
+
+
+@app.post("/api/ical/reset")
+def api_ical_reset():
+    return jsonify(ical_urls(new=True))
+
+
+@app.get("/api/bill/<session>/<bill>/compare")
+def api_compare(session, bill):
+    """Redline between any two posted versions of a bill."""
+    bill = want_bill(bill)
+    session = session.upper()
+    d = get_detail(session, bill)
+    if not d:
+        abort(404, "Bill not found.")
+    versions = {v["url"]: v["name"] for v in d.get("documents", []) if v.get("group", "").startswith("Versions of")}
+    a, b = request.args.get("a", ""), request.args.get("b", "")
+    if a not in versions or b not in versions:
+        abort(400, "Pick two versions of this bill.")
+    try:
+        ta, tb = sm.bill_text(a), sm.bill_text(b)
+    except Exception as e:  # noqa: BLE001
+        abort(502, f"Couldn't download the bill text: {e}")
+    r = rl.diff(ta, tb)
+    kc = rl.keyword_changes(ta, tb, bill_keywords(session, bill))
+    return jsonify(old=versions[a], new=versions[b], headline=rl.headline(r), html=rl.changes_html(r, limit=60),
+                   count=len(r["changes"]), gained=kc["gained"], lost=kc["lost"])
+
+
+@app.get("/api/redline/<int:rid>")
+def api_redline(rid):
+    with db() as c:
+        r = c.execute("SELECT * FROM redlines WHERE id=?", (rid,)).fetchone()
+    if not r:
+        abort(404, "Not found.")
+    d, kc = json.loads(r["diff"]), json.loads(r["keywords"] or "{}")
+    return jsonify(old=r["old_version"], new=r["new_version"], headline=r["headline"], html=rl.changes_html(d, limit=80),
+                   count=len(d["changes"]), gained=kc.get("gained", []), lost=kc.get("lost", []), at=r["at"], link=r["new_url"])
+
+
+@app.get("/api/report")
+def api_report():
+    s = want_session()
+    scope = request.args.get("scope") or settings().get("report_scope", "onevoice")
+    mon, rows = report_rows(s, request.args.get("week"), scope)
+    return jsonify(week=mon.date().isoformat(), label=report_label(mon), filename=report_filename(mon), scope=scope, rows=rows,
+                   last_sent=meta_get("last_weekly_report"))
+
+
+@app.post("/api/report/prepare")
+def api_report_prepare():
+    body = request.get_json(force=True) or {}
+    s = (body.get("session") or DEFAULT_SESSION).upper()
+    if not start_job("report", s, lambda p: prepare_report(s, body.get("week"), p)):
+        return jsonify(error="Another update is running. Try again in a minute."), 409
+    return jsonify(ok=True)
+
+
+@app.get("/api/report.xlsx")
+def api_report_xlsx():
+    s = want_session()
+    mon, rows = report_rows(s, request.args.get("week"), request.args.get("scope") or settings().get("report_scope", "onevoice"))
+    return Response(report_xlsx(rows), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename={report_filename(mon)}"})
+
+
+@app.post("/api/report/send")
+def api_report_send():
+    body = request.get_json(force=True) or {}
+    to = None
+    if body.get("to"):
+        to, bad = parse_addresses(body["to"])
+        if bad:
+            abort(400, f"These don't look like email addresses: {', '.join(bad)}")
+    r = send_weekly_report(body.get("week"), to, force=True)
+    if not r["sent"]:
+        return jsonify(error=r["reason"]), 400
+    return jsonify(r)
+
+
+def want_year() -> int:
+    try:
+        y = int(request.args.get("year") or GOAL_YEAR)
+    except ValueError:
+        abort(400, "Invalid year")
+    return max(2020, min(2100, y))
+
+
+@app.get("/api/goals")
+def api_goals():
+    return jsonify(compute_goals(want_year()))
+
+
+@app.get("/api/goals/log")
+def api_goals_log():
+    kind = request.args.get("kind")
+    rows = goal_entries(want_year(), kind if kind in ("meeting", "donor", "activity") else None)
+    q = (request.args.get("q") or "").strip().lower()
+    if q:
+        rows = [r for r in rows if q in json.dumps(r).lower()]
+    for r in rows:
+        r["bills_display"] = [ok.display_bill(b) for b in r.get("bills", [])]
+    return jsonify(rows)
+
+
+@app.post("/api/goals/log")
+def api_goals_add():
+    body = request.get_json(force=True) or {}
+    kind = body.get("kind")
+    date, data = clean_entry(kind, body)
+    with db() as c:
+        cur = c.execute("INSERT INTO goal_log(kind,date,data,created_at) VALUES(?,?,?,?)", (kind, date, json.dumps(data), now_iso()))
+    return jsonify(id=cur.lastrowid, kind=kind, date=date, **data)
+
+
+@app.put("/api/goals/log/<int:eid>")
+def api_goals_edit(eid):
+    body = request.get_json(force=True) or {}
+    with db() as c:
+        r = c.execute("SELECT kind FROM goal_log WHERE id=?", (eid,)).fetchone()
+    if not r:
+        abort(404, "That entry was deleted.")
+    date, data = clean_entry(r["kind"], body)
+    with db() as c:
+        c.execute("UPDATE goal_log SET date=?, data=?, updated_at=? WHERE id=?", (date, json.dumps(data), now_iso(), eid))
+    return jsonify(id=eid, kind=r["kind"], date=date, **data)
+
+
+@app.delete("/api/goals/log/<int:eid>")
+def api_goals_delete(eid):
+    with db() as c:
+        c.execute("DELETE FROM goal_log WHERE id=?", (eid,))
+    return jsonify(ok=True)
+
+
+@app.post("/api/goals/milestone")
+def api_goals_milestone():
+    body = request.get_json(force=True) or {}
+    year = int(body.get("year") or GOAL_YEAR)
+    if body.get("id") not in {m[0] for m in MILESTONES}:
+        abort(400, "Unknown milestone.")
+    done = meta_get(f"goal_milestones:{year}") or {}
+    if body.get("done"):
+        done[body["id"]] = {"at": now_iso()}
+    else:
+        done.pop(body["id"], None)
+    meta_set(f"goal_milestones:{year}", done)
+    return jsonify(compute_goals(year))
+
+
+@app.put("/api/goals/targets")
+def api_goals_targets():
+    body = request.get_json(force=True) or {}
+    cur = meta_get("goal_targets") or {}
+    for k, v in body.items():
+        if k in DEFAULT_TARGETS:
+            try:
+                cur[k] = max(0, int(v))
+            except (TypeError, ValueError):
+                abort(400, f"'{v}' isn't a number.")
+    meta_set("goal_targets", cur)
+    return jsonify(compute_goals(want_year()))
+
+
+@app.post("/api/goals/bill")
+def api_goals_bill():
+    """Count or don't count a bill toward 'OneVoice-aligned bills passed'."""
+    body = request.get_json(force=True) or {}
+    year = int(body.get("year") or GOAL_YEAR)
+    session = f"{str(year)[2:]}00"
+    bill = want_bill(body.get("bill") or "")
+    over = meta_get(f"goal_bills:{session}") or {}
+    if body.get("count") is None:
+        over.pop(bill, None)
+    else:
+        over[bill] = bool(body["count"])
+    meta_set(f"goal_bills:{session}", over)
+    return jsonify(compute_goals(year))
+
+
+@app.get("/api/goals/export.xlsx")
+def api_goals_export():
+    y = want_year()
+    return Response(goals_xlsx(y), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    headers={"Content-Disposition": f"attachment; filename=Government_Affairs_Goals_{y}.xlsx"})
 
 
 # --------------------------------------------------------------------- main

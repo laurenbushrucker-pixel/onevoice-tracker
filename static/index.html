@@ -42,6 +42,10 @@
     <a href="#find" data-view="find">Bill Search</a>
     <a href="#mine" data-view="mine">My Bills <span class="count" id="count-mine"></span></a>
     <a href="#agenda" data-view="agenda">Agenda</a>
+    <a href="#scoreboard" data-view="scoreboard">Scoreboard</a>
+    <a href="#goals" data-view="goals">Goals</a>
+    <a href="#meetings" data-view="meetings">Meetings</a>
+    <a href="#report" data-view="report">Friday Report</a>
     <a href="#updates" data-view="updates">Updates <span class="count count-alert" id="count-updates" hidden></span></a>
     <a href="#settings" data-view="settings">Settings</a>
   </nav>
@@ -63,6 +67,10 @@
       <a class="tile" href="#press"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 5h13v14H6a2 2 0 0 1-2-2z M17 9h3v8a2 2 0 0 1-2 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M7 9h7M7 13h7M7 16h4" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Press Releases</b><span class="tile-sub" id="tile-press">Senate, House, Governor, agencies</span></a>
       <a class="tile" href="#mine"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 3h12v18l-6-4-6 4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg></span><b>My Bills</b><span class="tile-sub" id="tile-mine">Bills with a Chamber position</span></a>
       <a class="tile" href="#agenda"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 5h14M5 12h14M5 19h9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>OneVoice Agenda</b><span class="tile-sub">The 21 state priorities</span></a>
+      <a class="tile" href="#scoreboard"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Scoreboard</b><span class="tile-sub" id="tile-score">How the session is going</span></a>
+      <a class="tile" href="#goals"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="4.5" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/></svg></span><b>2027 Goals</b><span class="tile-sub" id="tile-goals">Government Affairs scorecard</span></a>
+      <a class="tile" href="#meetings"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="2"/><circle cx="16" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M2.5 19c.6-3 2.8-5 5.5-5s4.9 2 5.5 5M13.5 14.3c.8-.2 1.6-.3 2.5-.3 2.7 0 4.9 2 5.5 5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Meetings</b><span class="tile-sub" id="tile-meetings">Who we met and what we discussed</span></a>
+      <a class="tile" href="#report"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 8h8M8 12h8M8 16h5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg></span><b>Friday Report</b><span class="tile-sub">Bill Track sheet for Members</span></a>
       <a class="tile" href="#settings"><span class="tile-ico" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 8 3 8H3s3-1 3-8M10 20a2 2 0 0 0 4 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/></svg></span><b>Alerts &amp; Settings</b><span class="tile-sub">Email, notifications, status</span></a>
     </div>
     <div class="panel get-app" id="get-app" hidden></div>
@@ -82,6 +90,7 @@
     <div class="toolbar cal-tools">
       <label class="check" for="cal-only"><input type="checkbox" id="cal-only"> Only meetings with OneVoice bills</label>
       <button class="btn btn-ghost btn-sm" id="cal-today" type="button">This week</button>
+      <a class="btn btn-ghost btn-sm" href="#settings-outlook" id="cal-outlook">Add to Outlook</a>
     </div>
     <div id="cal-days" class="cal-days"></div>
     <p class="hint">Meetings come from the House and Senate meeting schedules and are checked every 20 minutes. Agendas are read automatically to list the bills being heard. Tracked bills and bills you marked Relevant are highlighted, and you’re alerted when one is put on an agenda.</p>
@@ -102,10 +111,64 @@
     <div class="center"><button class="btn btn-ghost" id="press-more" type="button" hidden>Show more</button></div>
   </section>
 
+  <!-- Session scoreboard -->
+  <section id="view-scoreboard" class="view" hidden>
+    <div class="page-head"><div><h2 id="sb-title">Session scoreboard</h2><p class="hint" id="sb-sub"></p></div>
+      <button class="btn btn-ghost btn-sm" type="button" id="sb-table-toggle" aria-pressed="false">Show as tables</button></div>
+    <div class="kpis" id="sb-kpis"></div>
+    <div class="charts" id="sb-charts"></div>
+    <div class="panel wide" id="sb-wins"></div>
+  </section>
+
+  <!-- Goals -->
+  <section id="view-goals" class="view" hidden>
+    <div class="page-head"><div><h2 id="goals-title">2027 Government Affairs goals</h2><p class="hint" id="goals-sub"></p></div>
+      <div class="row-end"><select id="goals-year" aria-label="Year"></select>
+      <a class="btn btn-ghost btn-sm" id="goals-export" href="#">Download (Excel)</a></div></div>
+    <div class="seg" role="tablist" id="goals-tabs">
+      <button type="button" role="tab" data-gtab="score" aria-selected="true">Scorecard</button>
+      <button type="button" role="tab" data-gtab="log" aria-selected="false">Donors &amp; activities</button>
+      <button type="button" role="tab" data-gtab="milestones" aria-selected="false">Milestones</button>
+    </div>
+    <div id="goals-score"></div>
+    <div id="goals-log" hidden></div>
+    <div id="goals-milestones" hidden></div>
+  </section>
+
+  <!-- Meetings log -->
+  <section id="view-meetings" class="view" hidden>
+    <div class="page-head"><div><h2>Meetings</h2><p class="hint">Who met, when, and what was discussed. In-person meetings count toward the 2027 contact goals.</p></div>
+      <button class="btn" type="button" id="mt-add">+ Log a meeting</button></div>
+    <form class="panel wide" id="mt-form" hidden></form>
+    <div class="toolbar"><input type="search" id="mt-q" placeholder="Search meetings (names, issues, bills)" aria-label="Search meetings">
+      <select id="mt-year" aria-label="Year"></select></div>
+    <p class="hint" id="mt-meta"></p>
+    <ol class="log-list" id="mt-list"></ol>
+  </section>
+
+  <!-- Friday report -->
+  <section id="view-report" class="view" hidden>
+    <div class="page-head"><div><h2>Friday Report for Members</h2>
+      <p class="hint">The Bill Track sheet: every OneVoice and tracked bill with action this week, by track, with its summary and last action date. It emails itself to you every Friday at noon during session.</p></div></div>
+    <div class="cal-head">
+      <button class="btn btn-ghost btn-round" id="rp-prev" type="button" aria-label="Previous week">‹</button>
+      <div class="cal-title"><b id="rp-week">This week</b><span class="hint" id="rp-count"></span></div>
+      <button class="btn btn-ghost btn-round" id="rp-next" type="button" aria-label="Next week">›</button>
+    </div>
+    <div class="toolbar">
+      <select id="rp-scope" aria-label="Which bills"><option value="onevoice">OneVoice and tracked bills</option><option value="watched">Only tracked and Relevant bills</option></select>
+      <a class="btn" id="rp-download" href="#">Download Excel</a>
+      <button class="btn btn-ghost" type="button" id="rp-email">Email it to me</button>
+      <button class="btn btn-ghost btn-sm" type="button" id="rp-prepare">Double-check dates</button>
+    </div>
+    <div id="rp-table"></div>
+  </section>
+
   <!-- More (phones) -->
   <section id="view-more" class="view" hidden>
     <nav class="more-list" aria-label="More">
       <a href="#find">Bill Search</a><a href="#mine">My Bills</a><a href="#agenda">OneVoice Agenda</a>
+      <a href="#scoreboard">Session Scoreboard</a><a href="#goals">2027 Goals</a><a href="#meetings">Meetings log</a><a href="#report">Friday Report for Members</a>
       <a href="#updates">Updates on tracked bills</a><a href="#settings">Alerts &amp; Settings</a>
     </nav>
     <div class="panel">
@@ -243,6 +306,22 @@
         <div class="cats" id="push-kinds" hidden></div>
       </div>
     </div>
+    <div class="panel" id="settings-outlook">
+      <h2>Hearings in your Outlook calendar</h2>
+      <p class="hint">Subscribe once and every committee meeting with a OneVoice, tracked or Relevant bill appears in Outlook (or Google or iPhone calendar) with the agenda link and the bills being heard. Canceled meetings update themselves. Outlook refreshes subscribed calendars every few hours.</p>
+      <label class="stack" for="ical-url">Calendar link
+        <div class="copy-row"><input id="ical-url" readonly><button class="btn btn-sm" type="button" id="ical-copy">Copy</button></div></label>
+      <label class="check" for="ical-all"><input type="checkbox" id="ical-all"> Include every committee meeting, not just ones with our bills</label>
+      <details class="howto"><summary>How to add it to Outlook</summary>
+        <ol><li>Tap <b>Copy</b> above.</li>
+        <li>Outlook on the web or new Outlook: open <b>Calendar</b>, click <b>Add calendar</b>, then <b>Subscribe from web</b>.</li>
+        <li>Paste the link, name it “OneVoice hearings”, and click <b>Import</b>.</li>
+        <li>On an iPhone: Settings › Calendar › Accounts › Add Account › Other › <b>Add Subscribed Calendar</b>, and paste the link.</li></ol>
+        <p class="hint">Anyone with this link can see the hearing calendar (nothing else). If it gets shared too widely, make a new link; the old one stops working.</p>
+      </details>
+      <div class="row-end"><a class="btn btn-ghost btn-sm" id="ical-open" href="#">Open in calendar app</a>
+        <span id="ical-reset-area"><button class="btn btn-ghost btn-sm" type="button" id="ical-reset">Make a new link</button></span></div>
+    </div>
     <div class="panel">
       <h2>Is everything working?</h2>
       <div id="health" class="health"></div>
@@ -280,6 +359,16 @@
         <label class="check" for="s-movement"><input type="checkbox" id="s-movement"> Email me when a bill I track has a new action</label>
         <div class="cats" id="s-cats"></div>
         <p class="hint" id="movement-hint"></p>
+      </fieldset>
+      <fieldset class="group">
+        <legend>When a bill is rewritten</legend>
+        <label class="check" for="s-redline"><input type="checkbox" id="s-redline"> Email me “What changed?” with a redline when a tracked or Relevant bill gets a new version</label>
+      </fieldset>
+      <fieldset class="group">
+        <legend>Friday report for Members</legend>
+        <label class="check" for="s-report"><input type="checkbox" id="s-report"> Email the Bill Track spreadsheet every Friday at <span id="report-hour">noon</span> Central (only in weeks when bills moved)</label>
+        <label class="stack" for="s-report-to">Send the report to (leave blank to use the alert list above)
+          <textarea id="s-report-to" rows="2" placeholder="name@example.org"></textarea></label>
       </fieldset>
       <div class="row-end">
         <button class="btn" type="submit">Save settings</button>
