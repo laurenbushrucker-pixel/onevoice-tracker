@@ -1555,6 +1555,7 @@ function meetingForm(e = {}) {
     </div>
     <label class="stack">Follow-up<input name="follow_up" value="${esc(e.follow_up || "")}" placeholder="Next steps and who owns them"></label>
     <label class="check"><input type="checkbox" name="in_person" ${e.in_person === false ? "" : "checked"}> In person (counts toward the face-to-face contact goal)</label>
+    <input type="hidden" name="legislators" value="${esc((e.legislators || []).join(","))}">
     <div class="row-end"><button class="btn" type="submit">${e.id ? "Save changes" : "Save meeting"}</button><button class="btn btn-ghost" type="button" id="mt-cancel">Cancel</button></div>`;
 }
 function openMeetingForm(e) {
@@ -1702,6 +1703,21 @@ function renderDirectory() {
     || `<li class="empty"><h2>No one matches</h2><p>Try a different name, town or county.</p></li>`;
   photoFallback($("#dir-list"));
 }
+function meetingDetail(e) {
+  const people = (e.people || "").split(/[\n;]+/).map((x) => x.trim()).filter(Boolean);
+  const row = (label, val) => val ? `<p><b>${label}:</b> ${val}</p>` : "";
+  return `<li class="log-card">
+    <div class="log-top"><span class="date">${fmtDate(e.date)}</span><span class="chip">${esc(LEVELS[e.level] || "")}</span>${e.in_person === false ? '<span class="chip">Not in person</span>' : ""}</div>
+    ${row("Who met", esc(people.join(", ")))}
+    ${row("Office", esc(e.entity))}
+    ${row("Chamber staff", esc(e.staff))}
+    ${e.overview ? `<p class="log-overview">${esc(e.overview)}</p>` : ""}
+    ${row("Issues", esc(e.issues))}
+    ${e.bills && e.bills.length ? row("Bills", e.bills.map((b, i) => `<button class="linklike" type="button" data-open-bill="${esc(b)}">${esc((e.bills_display || [])[i] || b)}</button>`).join(", ")) : ""}
+    ${row("Follow-up", esc(e.follow_up))}
+    <div class="row-end"><button class="btn btn-ghost btn-sm" type="button" data-edit-meeting="${e.id}">Edit</button></div>
+  </li>`;
+}
 async function openLegislator(slugKey) {
   const [ch, ...rest] = slugKey.split("-");
   const slug = rest.join("-");
@@ -1734,19 +1750,24 @@ async function openLegislator(slugKey) {
     ${r.hearings.length ? `<section class="panel wide"><h3 class="section-h">Their upcoming committee meetings</h3><ul class="plain">${r.hearings.map((m) => `<li><a href="#calendar">${esc(fmtWhen(m.start, m.time_text))} · ${esc(m.committee)}</a>${m.bills.length ? ` <span class="hint">· ${esc(m.bills.slice(0, 8).join(", "))}</span>` : ""}</li>`).join("")}</ul></section>` : ""}
     <section class="panel wide"><div class="row-between"><h3 class="section-h">Meetings with the Chamber (${r.meetings.length})</h3>
       <button class="btn btn-sm" type="button" id="leg-log">+ Log a meeting with ${esc(r.chamber === "House" ? "Rep." : "Sen.")} ${esc(r.last)}</button></div>
-      ${r.meetings.length ? `<ol class="log-list">${r.meetings.map((e) => `<li class="log-card"><div class="log-top"><span class="date">${fmtDate(e.date)}</span>${e.staff ? `<span class="hint">with ${esc(e.staff)}</span>` : ""}</div>
-        ${e.overview ? `<p class="log-overview">${esc(e.overview)}</p>` : ""}${e.follow_up ? `<p><b>Follow-up:</b> ${esc(e.follow_up)}</p>` : ""}</li>`).join("")}</ol>`
-        : `<p class="hint">No meetings logged yet. Meetings count here when the legislator’s name is in “Who met.”</p>`}</section>
+      ${r.meetings.length ? `<ol class="log-list">${r.meetings.map((e) => meetingDetail(e)).join("")}</ol>`
+        : `<p class="hint">No meetings logged yet. Tap the button above, or log a meeting with their name in “Who met.”</p>`}</section>
     <section class="panel wide"><h3 class="section-h">Bills they authored (${r.bills.length}${r.onevoice_count ? `, ${r.onevoice_count} OneVoice` : ""})</h3>
       ${r.bills.length ? `<ul class="leg-bills">${r.bills.map((b) => `<li><button class="linklike" type="button" data-open-bill="${esc(b.bill)}"><b>${esc(b.display)}</b></button>
         ${b.onevoice.map((t) => `<span class="chip chip-ov">${esc(t)}</span>`).join("")}${b.position ? `<span class="pill pos-${esc(b.position)}">${esc(cap(b.position))}</span>` : ""}
         <div>${esc(b.title)}</div><div class="hint">${b.role === "primary" ? "Author" : "Principal author in the other chamber"} · ${esc(b.stage_label)}</div></li>`).join("")}</ul>`
         : `<p class="hint">No bills found yet. This lists OneVoice and tracked bills, plus any bill you’ve opened, this session.</p>`}</section>`;
   photoFallback(box);
+  box.querySelectorAll("[data-edit-meeting]").forEach((b) => b.addEventListener("click", () => {
+    const e = r.meetings.find((m) => m.id === Number(b.dataset.editMeeting));
+    location.hash = "#meetings";
+    setTimeout(() => openMeetingForm(e), 150);
+  }));
   box.querySelectorAll("[data-open-bill]").forEach((b) => b.addEventListener("click", () => openBill(state.session, b.dataset.openBill)));
   $("#leg-log").addEventListener("click", () => {
     location.hash = "#meetings";
-    setTimeout(() => openMeetingForm({ people: legTitle(r), level: "state", entity: r.chamber === "House" ? "Oklahoma House of Representatives" : "Oklahoma State Senate" }), 150);
+    setTimeout(() => openMeetingForm({ people: legTitle(r), level: "state", legislators: [r.key],
+      entity: r.chamber === "House" ? "Oklahoma House of Representatives" : "Oklahoma State Senate" }), 150);
   });
   window.scrollTo(0, 0);
 }

@@ -3236,6 +3236,12 @@ def compute_goals(year: int) -> dict:
             "counts": {"meetings": sum(1 for e in entries if e["kind"] == "meeting"), "donors": len(donors), "activities": len(acts)}}
 
 
+def legislator_keys(raw) -> list[str]:
+    """Legislators a meeting was logged for, e.g. ['S:david-bullard'] (from their directory page)."""
+    items = raw if isinstance(raw, list) else re.split(r"[,\s]+", str(raw or ""))
+    return [k for k in dict.fromkeys(str(x).strip() for x in items) if re.fullmatch(r"[HS]:[a-z0-9-]{1,80}", k)][:20]
+
+
 def clean_entry(kind: str, body: dict) -> tuple[str, dict]:
     date = str(body.get("date") or "")[:10]
     try:
@@ -3248,7 +3254,8 @@ def clean_entry(kind: str, body: dict) -> tuple[str, dict]:
             abort(400, "Add who you met with.")
         data = {"people": s("people", 1000), "entity": s("entity", 300), "level": body.get("level") if body.get("level") in LEVELS else "state",
                 "staff": s("staff", 300), "issues": s("issues", 500), "overview": s("overview", 8000), "follow_up": s("follow_up", 2000),
-                "in_person": bool(body.get("in_person", True)), "bills": [b for b in (ok.normalize_bill(x) for x in re.split(r"[,;\n]+", s("bills", 300)) if x.strip()) if b]}
+                "in_person": bool(body.get("in_person", True)), "bills": [b for b in (ok.normalize_bill(x) for x in re.split(r"[,;\n]+", s("bills", 300)) if x.strip()) if b],
+                "legislators": legislator_keys(body.get("legislators"))}
     elif kind == "donor":
         if not s("name"):
             abort(400, "Add the donor's name.")
@@ -3590,15 +3597,32 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower().replace("&", " and ")).strip()
 
 
-def meetings_with(leg: dict, entries: list[dict]) -> list[dict]:
-    """Logged meetings that name this legislator."""
-    last, first = _norm(leg["last"]), _norm(leg["first"]).split(" ")[0] if leg["first"] else ""
-    title = "rep" if leg["chamber"] == "House" else "sen"
+def shared_last_names() -> set[str]:
+    """Last names more than one legislator has (those need a first name or title to match)."""
+    with db() as c:
+        names = [_norm(r["last"]) for r in c.execute("SELECT last FROM legislators")]
+    return {n for n in names if names.count(n) > 1}
+
+
+def meetings_with(leg: dict, entries: list[dict], shared: set[str] | None = None) -> list[dict]:
+    """Logged meetings with this legislator: ones logged from their page, or whose "Who met" or
+    office names them (last name, plus a first name or title when two members share it)."""
+    if shared is None:
+        shared = shared_last_names()
+    last = _norm(leg["last"])
+    firsts = {w for w in _norm(leg["first"]).split() if len(w) > 1}
+    titles = r"(rep|representative|state rep)" if leg["chamber"] == "House" else r"(sen|senator|state sen)"
     hits = []
     for e in entries:
-        for line in people_of(e):
+        if leg["key"] in (e.get("legislators") or []):
+            hits.append(e)
+            continue
+        for line in people_of(e) + [e.get("entity") or ""]:
             n = _norm(line)
-            if re.search(rf"\b{re.escape(last)}\b", n) and ((first and re.search(rf"\b{re.escape(first)}\b", n)) or re.match(rf"{title}\b", n)):
+            if not last or not re.search(rf"\b{re.escape(last)}\b", n):
+                continue
+            if (last not in shared or any(re.search(rf"\b{re.escape(f)}\b", n) for f in firsts)
+                    or re.search(rf"\b{titles}\b", n)):
                 hits.append(e)
                 break
     return hits
@@ -3617,11 +3641,12 @@ def legislator_counts(session: str, rows: list[dict]) -> None:
     ovb = onevoice_bills(session)
     auth = authored_bills(session)
     meetings = goal_log_all("meeting")
+    shared = shared_last_names()
     for r in rows:
         mine = auth.get(r["key"], [])
         r["bills_count"] = len(mine)
         r["onevoice_count"] = sum(1 for b, _ in mine if b in ovb)
-        r["meetings_count"] = len(meetings_with(r, meetings))
+        r["meetings_count"] = len(meetings_with(r, meetings, shared))
         r["tulsa"] = "Tulsa" in r["counties"]
         r["region"] = any(x in TULSA_REGION for x in r["counties"])
 

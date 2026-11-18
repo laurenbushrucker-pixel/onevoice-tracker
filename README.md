@@ -162,7 +162,7 @@ district, hometown, email or contact form, office, phone, assistant, committees,
 and the counties and towns in their district. Filter to the Tulsa Region (Tulsa, Rogers,
 Wagoner, Osage, Creek, Okmulgee and Pawnee counties). Each profile shows the OneVoice and tracked bills
 they authored (taken from the author links on oklegislature.gov), their
-upcoming committee meetings, and every meeting your team logged with them, with
+upcoming committee meetings, and every meeting your team logged with them (matched by name, or linked when logged from their page) with full details, with
 a button to log a new one. Author names on a bill's page link to the profile.
 
 ## Staying reliable
