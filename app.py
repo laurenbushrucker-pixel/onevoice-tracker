@@ -482,12 +482,24 @@ def send_alerts(only: tuple[str, str] | None = None) -> dict:
 
     pri = {p["id"]: p for p in get_priorities()}
     by_session: dict[str, dict[str, dict]] = {}
+    authors: dict[tuple[str, str], str] = {}
     for r in rows:
+        key = (r["session"], r["bill"])
+        if key not in authors:
+            authors[key] = r["author"] or ""
+            if not authors[key]:
+                # Found through the subject index, so its own page (which names the author) hasn't been read yet.
+                try:
+                    d = get_detail(r["session"], r["bill"], refresh=True)
+                    if d:
+                        authors[key] = author_text(d.get("author", ""), d.get("other_author", ""))
+                except RuntimeError:
+                    pass  # the site didn't answer; the email still goes out on time
         bills = by_session.setdefault(r["session"], {})
         item = bills.setdefault(r["bill"], {
             "display": ok.display_bill(r["bill"]), "title": r["title"] or "",
             "url": ok.bill_url(r["bill"], r["session"]), "last_action": r["last_action"] or "", "priorities": [],
-            "author": r["author"] or "", "summary": r["summary"] or "", "summary_model": r["summary_model"] or "",
+            "author": authors[key], "summary": r["summary"] or "", "summary_model": r["summary_model"] or "",
             "progress": bill_progress(r["session"], r["bill"]),
         })
         p = pri.get(r["priority_id"])
