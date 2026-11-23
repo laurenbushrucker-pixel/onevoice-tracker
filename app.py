@@ -204,6 +204,11 @@ def init_db() -> None:
         if not c.execute("SELECT 1 FROM priorities LIMIT 1").fetchone():
             seed_priorities(c)
     saved = meta_get("settings") or {}
+    if not meta_get("press_all_default"):  # the team asked for every press release by email; switch once
+        if saved.get("press_email", "tracked") == "tracked":
+            saved["press_email"] = "all"
+            meta_set("settings", saved)
+        meta_set("press_all_default", now_iso())
     if APP_URL and ".sslip.io" in (saved.get("app_url") or "") and ".sslip.io" not in APP_URL:
         saved["app_url"] = APP_URL  # the server moved to its own address: follow it in emails and links
         meta_set("settings", saved)
@@ -284,7 +289,7 @@ def settings() -> dict:
         "movement_enabled": s.get("movement_enabled", True),
         "movement_categories": s.get("movement_categories", ok.DEFAULT_MOVEMENT_CATEGORIES),
         "hearing_email": s.get("hearing_email", True),
-        "press_email": s.get("press_email", "tracked"),  # tracked | agenda | off
+        "press_email": s.get("press_email", "all"),  # all | tracked | agenda | off
         "redline_email": s.get("redline_email", True),
         "report_enabled": s.get("report_enabled", True),
         "report_scope": s.get("report_scope", "onevoice"),  # onevoice | watched
@@ -1207,7 +1212,7 @@ def send_press_alerts() -> int:
         bills = [b for b in json.loads(r["bills"] or "[]") if b in watch]
         prs = [p for p in json.loads(r["priorities"] or "[]") if any("(title)" in k for k in p["keywords"])]
         mode = st["press_email"]
-        relevant = bool(bills) or (mode == "agenda" and prs)
+        relevant = bool(bills) or (mode == "agenda" and prs) or mode == "all"
         delivered = False
         if relevant and mode != "off":
             item = {"source": r["source"], "title": r["title"], "url": r["url"], "published": r["published"],
@@ -2592,7 +2597,7 @@ def api_settings_update():
         s["alerts_enabled"] = bool(body["alerts_enabled"])
     if "app_url" in body:
         s["app_url"] = str(body["app_url"]).strip()[:300]
-    if body.get("press_email") in ("tracked", "agenda", "off"):
+    if body.get("press_email") in ("all", "tracked", "agenda", "off"):
         s["press_email"] = body["press_email"]
     if body.get("report_scope") in ("onevoice", "watched"):
         s["report_scope"] = body["report_scope"]
