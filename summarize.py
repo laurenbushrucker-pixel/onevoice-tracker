@@ -13,7 +13,11 @@ import requests
 
 import oklegis as ok
 
-MODEL = os.environ.get("BILLTRACKER_SUMMARY_MODEL", "claude-opus-5-5")
+# Where Claude runs: "anthropic" (an Anthropic API key) or "vertex" (Claude on Google Cloud
+# Vertex AI, billed to the Google Cloud account, using the server's Google sign-in).
+PROVIDER = os.environ.get("BILLTRACKER_AI", "anthropic").strip().lower()
+VERTEX = PROVIDER == "vertex"
+MODEL = os.environ.get("BILLTRACKER_SUMMARY_MODEL") or ("claude-sonnet-5-5" if VERTEX else "claude-opus-5-5")
 MAX_TEXT_CHARS = 600_000  # ~150K tokens; longer bills are summarized from the start and flagged
 
 SYSTEM = """You write short summaries of Oklahoma legislative bills for the policy team of a regional chamber of commerce.
@@ -34,13 +38,18 @@ class SummaryUnavailable(RuntimeError):
 
 
 def available() -> bool:
-    return bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
+    return VERTEX or bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
 def client() -> anthropic.Anthropic:
     global _client
     if _client is None:
-        _client = anthropic.Anthropic()
+        if VERTEX:
+            _client = anthropic.AnthropicVertex(
+                project_id=os.environ.get("GOOGLE_CLOUD_PROJECT") or anthropic.NOT_GIVEN,
+                region=os.environ.get("VERTEX_REGION", "global"))
+        else:
+            _client = anthropic.Anthropic()
     return _client
 
 
@@ -81,7 +90,7 @@ def bill_text(url: str) -> str:
 def summarize(display: str, title: str, version: str, text: str) -> tuple[str, bool]:
     """Returns (summary, truncated)."""
     if not available():
-        raise SummaryUnavailable("AI summaries are off: set ANTHROPIC_API_KEY on the server.")
+        raise SummaryUnavailable("AI summaries are off: set ANTHROPIC_API_KEY, or run deploy/enable-vertex.sh, on the server.")
     truncated = len(text) > MAX_TEXT_CHARS
     body = text[:MAX_TEXT_CHARS] if truncated else text
     note = "\n\n(The bill text was cut off here because it is very long; summarize what is shown and say the bill is long.)" if truncated else ""
@@ -89,24 +98,38 @@ def summarize(display: str, title: str, version: str, text: str) -> tuple[str, b
         f"Bill: {display}\nOfficial title: {title}\nVersion: {version or 'unknown'}\n\n"
         f"<bill_text>\n{body or '(No bill text is available yet; summarize from the official title, and say so.)'}{note}\n</bill_text>"
     )
+    service = "Claude on Google Cloud" if VERTEX else "The Anthropic API"
     try:
-        response = client().beta.messages.create(
-            model=MODEL,
-            max_tokens=2000,
-            system=SYSTEM,
-            output_config={"effort": "low"},
-            betas=["server-side-fallback-2026-07-01"],
-            fallbacks="default",
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except anthropic.AuthenticationError as e:
-        raise SummaryUnavailable("The Anthropic API key was rejected. Check ANTHROPIC_API_KEY on the server.") from e
+        if VERTEX:  # no server-side fallbacks on Vertex AI; a declined bill keeps its free summary
+            response = client().messages.create(
+                model=MODEL, max_tokens=2000, system=SYSTEM, output_config={"effort": "low"},
+                messages=[{"role": "user", "content": prompt}],
+            )
+        else:
+            response = client().beta.messages.create(
+                model=MODEL,
+                max_tokens=2000,
+                system=SYSTEM,
+                output_config={"effort": "low"},
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+                messages=[{"role": "user", "content": prompt}],
+            )
+    except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as e:
+        hint = ("Run deploy/enable-vertex.sh again to sign the server in to Google Cloud." if VERTEX
+                else "Check ANTHROPIC_API_KEY on the server.")
+        raise SummaryUnavailable(f"{service} refused the sign-in. {hint}") from e
+    except anthropic.NotFoundError as e:
+        raise SummaryUnavailable(f"{service} doesn't offer the model {MODEL} to this account. "
+                                 "Enable it in Vertex AI Model Garden, or set BILLTRACKER_SUMMARY_MODEL.") from e
     except anthropic.RateLimitError as e:
-        raise SummaryUnavailable("The Anthropic API rate limit was reached. Summaries will resume at the next check.") from e
+        raise SummaryUnavailable(f"{service} rate limit was reached. Summaries will resume at the next check.") from e
     except anthropic.APIStatusError as e:
-        raise SummaryUnavailable(f"The Anthropic API returned an error ({e.status_code}).") from e
+        raise SummaryUnavailable(f"{service} returned an error ({e.status_code}).") from e
     except anthropic.APIConnectionError as e:
-        raise SummaryUnavailable("Could not reach the Anthropic API.") from e
+        raise SummaryUnavailable(f"Could not reach {service}.") from e
+    except Exception as e:  # noqa: BLE001 - e.g. Google sign-in missing on the server
+        raise SummaryUnavailable(f"{service} isn't set up yet: {str(e)[:160]}") from e
     if response.stop_reason == "refusal":
         raise SummaryUnavailable("The model declined to summarize this bill.")
     summary = " ".join(b.text.strip() for b in response.content if b.type == "text").strip()
